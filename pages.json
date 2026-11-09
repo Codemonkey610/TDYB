@@ -1,0 +1,25 @@
+{
+	"pages": [ // 新壳：安全区头部 + 全屏 web-view
+		{
+			"path": "pages/webview/webview",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#ffffff"
+			}
+		},
+		{
+			"path": "pages/rtk-setting/rtk-setting",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#f5f6f8"
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationStyle": "custom",
+		"navigationBarTextStyle": "black",
+		"navigationBarTitleText": "TDYB",
+		"navigationBarBackgroundColor": "#ffffff",
+		"backgroundColor": "#ffffff"
+	}
+}

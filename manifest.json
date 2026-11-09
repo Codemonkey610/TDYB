@@ -1,0 +1,78 @@
+{
+	"name": "TDYB",
+	"appid": "__UNI__3ABC950",
+	"description": "TDYB 数据采集套壳（uni-app x）",
+	"versionName": "1.0.0",
+	"versionCode": "100",
+	"uni-app-x": {
+		"styleIsolationVersion": "2"
+	},
+	"vueVersion": "3",
+	"uniStatistics": {
+		"enable": false
+	},
+	"app": {
+		"distribute": {
+			"icons": {
+				"android": {
+					"hdpi": "",
+					"xhdpi": "",
+					"xxhdpi": "",
+					"xxxhdpi": ""
+				}
+			}
+		}
+	},
+	"app-android": {
+		"distribute": {
+			"packagename": "com.tdyb.chk",
+			"minSdkVersion": 23,
+			"targetSdkVersion": 34,
+			// 页面是 http 地址时必须为 true；正式环境换 https 后可删掉
+			"usesCleartextTraffic": true,
+			// 注意：这个字段（HBuilderX 里叫「额外添加的权限」）要求完整的 uses-permission XML，
+			// 不能只写 android.permission.XXX，否则会提示「格式不正确」
+			"permissions": [
+				"<uses-permission android:name=\"android.permission.INTERNET\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>",
+				"<uses-permission android:name=\"android.permission.CHANGE_WIFI_STATE\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_LOCATION_EXTRA_COMMANDS\"/>",
+				"<uses-permission android:name=\"android.permission.ACCESS_BACKGROUND_LOCATION\"/>",
+				"<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\"/>",
+				"<uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_LOCATION\"/>",
+				"<uses-permission android:name=\"android.permission.WAKE_LOCK\"/>"
+			],
+			"modules": {},
+			"icons": {
+				"hdpi": "E:/down/蓝绿田园延保盾牌图标.png",
+				"xhdpi": "E:/down/蓝绿田园延保盾牌图标.png",
+				"xxhdpi": "E:/down/蓝绿田园延保盾牌图标.png",
+				"xxxhdpi": "E:/down/蓝绿田园延保盾牌图标.png"
+			},
+			"splashScreens": {
+				"default": {}
+			},
+			"abiFilters": [
+				"armeabi-v7a",
+				"arm64-v8a",
+				"x86",
+				"x86_64"
+			]
+		}
+	},
+	"app-ios": {
+		"distribute": {
+			"modules": {},
+			"icons": {},
+			"splashScreens": {}
+		}
+	},
+	"web": {
+		"router": {
+			"mode": ""
+		}
+	}
+}

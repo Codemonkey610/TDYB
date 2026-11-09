@@ -1,0 +1,504 @@
+/**
+ * 高德定位 UTS 插件（uni-app x / App-Android）
+ *
+ * 对应旧壳 nativeplugins/Amap-Location，但改成 UTS 实现，摆脱 nativeplugin 机制。
+ * 只做一件事：把 AmapLocationClient 的 once / start / stop 包装成 Promise / 回调。
+ * 坐标由 SDK 原样返回（GCJ02），WGS84 转换放在壳的 utils/coord.uts 里做。
+ *
+ * 依赖：com.amap.api:location（见 config.json）
+ */
+
+import AMapLocationClient from 'com.amap.api.location.AMapLocationClient'
+import AMapLocationClientOption from 'com.amap.api.location.AMapLocationClientOption'
+import AMapLocationMode from 'com.amap.api.location.AMapLocationClientOption.AMapLocationMode'
+import AMapLocation from 'com.amap.api.location.AMapLocation'
+import AMapLocationListener from 'com.amap.api.location.AMapLocationListener'
+import Context from 'android.content.Context'
+import Intent from 'android.content.Intent'
+import PendingIntent from 'android.app.PendingIntent'
+import Notification from 'android.app.Notification'
+import NotificationManager from 'android.app.NotificationManager'
+import NotificationChannel from 'android.app.NotificationChannel'
+import NotificationCompatBuilder from 'androidx.core.app.NotificationCompat.Builder'
+import Build from 'android.os.Build'
+import Settings from 'android.provider.Settings'
+import Uri from 'android.net.Uri'
+import PowerManager from 'android.os.PowerManager'
+import PackageManager from 'android.content.pm.PackageManager'
+
+/* ------------------------------ 对外类型 ------------------------------ */
+
+export type TdybAmapLocation = {
+	longitude : number
+	latitude : number
+	altitude : number
+	accuracy : number
+	speed : number
+	bearing : number
+	coordType : string
+	locationType : number
+	time : number
+	errorCode : number
+	address : string
+	country : string
+	province : string
+	city : string
+	district : string
+	street : string
+	streetNum : string
+	poiName : string
+	cityCode : string
+	adCode : string
+}
+
+export type TdybAmapError = {
+	errCode : number
+	errMsg : string
+}
+
+export type TdybAmapOnceOptions = {
+	needAddress ?: boolean
+	onceLatest ?: boolean
+	httpTimeout ?: number
+	success ?: (res : TdybAmapLocation) => void
+	fail ?: (err : TdybAmapError) => void
+}
+
+export type TdybAmapStartOptions = {
+	interval ?: number
+	needAddress ?: boolean
+	success ?: (res : TdybAmapLocation) => void
+	fail ?: (err : TdybAmapError) => void
+}
+
+/* ------------------------------ 模块状态 ------------------------------ */
+
+let client : AMapLocationClient | null = null
+let listener : TdybAmapListener | null = null
+let onceOpts : TdybAmapOnceOptions | null = null
+let streamOpts : TdybAmapStartOptions | null = null
+let streamOption : AMapLocationClientOption | null = null
+let privacyReady : boolean = false
+let apiKey : string = ""
+
+/* ------------------------------ 监听器 ------------------------------ */
+
+class TdybAmapListener implements AMapLocationListener {
+	override onLocationChanged(location : AMapLocation | null) : void {
+		onReceive(location)
+	}
+}
+
+/* ------------------------------ 内部方法 ------------------------------ */
+
+function appContext() : Context {
+	return UTSAndroid.getAppContext()!
+}
+
+/**
+ * 高德 SDK 5.6.0 起强制隐私合规调用，不调会直接定位失败。
+ * 真实 App 里应在用户同意隐私政策后再初始化；这里默认同意，按需改成弹窗后再置 true。
+ */
+function ensurePrivacy() : void {
+	if (privacyReady) return
+	try {
+		AMapLocationClient.updatePrivacyShow(appContext(), true, true)
+		AMapLocationClient.updatePrivacyAgree(appContext(), true)
+	} catch (e) {
+		console.warn("[tdyb-amap] updatePrivacy 调用失败（SDK 版本过低？）", e)
+	}
+	privacyReady = true
+}
+
+function ensureClient() : AMapLocationClient {
+	if (client == null) {
+		ensurePrivacy()
+		if (apiKey != "") {
+			try {
+				AMapLocationClient.setApiKey(apiKey)
+			} catch (e) {
+				console.warn("[tdyb-amap] setApiKey 失败，请使用 manifest 配置 key", e)
+			}
+		}
+		client = new AMapLocationClient(appContext())
+		listener = new TdybAmapListener()
+		client!.setLocationListener(listener!)
+	}
+	return client!
+}
+
+function baseOption() : AMapLocationClientOption {
+	const opt = new AMapLocationClientOption()
+	opt.setLocationMode(AMapLocationMode.Hight_Accuracy)
+	opt.setLocationCacheEnable(true)
+	opt.setMockEnable(false)
+	opt.setNeedAddress(false)
+	opt.setOnceLocation(false)
+	opt.setHttpTimeOut(10000)
+	return opt
+}
+
+function mapError(code : number, info : string | null) : string {
+	let msg = info ?? ""
+	if (code == 12) msg = "定位权限被拒绝，请到系统设置里允许定位"
+	if (code == 13) msg = "定位失败，请到空旷处重试"
+	if (code == 14) msg = "定位超时，请检查网络与 GPS"
+	if (code == 15) msg = "高德 key 无效或包名/SHA1 不匹配"
+	return msg
+}
+
+function toResult(l : AMapLocation) : TdybAmapLocation {
+	// Java 的 float/long/int 不会隐式转 UTS 的 number，必须显式 toDouble
+	return {
+		longitude: l.getLongitude(),
+		latitude: l.getLatitude(),
+		altitude: l.getAltitude(),
+		accuracy: l.getAccuracy().toDouble(),
+		speed: l.getSpeed().toDouble(),
+		bearing: l.getBearing().toDouble(),
+		coordType: l.getCoordType() ?? "GCJ02",
+		locationType: l.getLocationType().toDouble(),
+		time: l.getTime().toDouble(),
+		errorCode: 0.0,
+		address: l.getAddress() ?? "",
+		country: l.getCountry() ?? "",
+		province: l.getProvince() ?? "",
+		city: l.getCity() ?? "",
+		district: l.getDistrict() ?? "",
+		street: l.getStreet() ?? "",
+		streetNum: l.getStreetNum() ?? "",
+		poiName: l.getPoiName() ?? "",
+		cityCode: l.getCityCode() ?? "",
+		adCode: l.getAdCode() ?? ""
+	}
+}
+
+function onReceive(location : AMapLocation | null) : void {
+	if (location == null) return
+
+	const code = location.getErrorCode().toDouble()
+	if (code != 0.0) {
+		const err : TdybAmapError = {
+			errCode: code,
+			errMsg: mapError(code, location.getErrorInfo())
+		}
+		const o = onceOpts
+		if (o != null) {
+			onceOpts = null
+			if (o.fail != null) o.fail!(err)
+		}
+		const s = streamOpts
+		if (s != null && s.fail != null) s.fail!(err)
+		return
+	}
+
+	const res = toResult(location)
+
+	const o = onceOpts
+	if (o != null) {
+		onceOpts = null
+		// 单次定位结束后：如果还有持续定位在跑，恢复它的参数继续收流，不要一刀切 stop
+		if (streamOpts != null && streamOption != null) {
+			try {
+				client!.setLocationOption(streamOption!)
+				client!.startLocation()
+			} catch (e) {
+			}
+		} else {
+			try {
+				client!.stopLocation()
+			} catch (e) {
+			}
+		}
+		if (o.success != null) o.success!(res)
+	}
+
+	const s = streamOpts
+	if (s != null && s.success != null) s.success!(res)
+}
+
+/* ------------------------------ 对外 API ------------------------------ */
+
+/** 运行时设置高德 Android key（也支持 manifest meta-data 方式） */
+export function setKey(key : string) : void {
+	apiKey = key
+}
+
+/** 申请定位权限（FINE + COARSE） */
+export function requestPermission() : Promise<boolean> {
+	return new Promise((resolve, _reject) => {
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) {
+			resolve(false)
+			return
+		}
+		// 注意：这版 UTS 的 requestSystemPermission 回调是 2 个参数 (allRight, granted)，
+		// 不是 3 个，多写一个 denied 会报 Function3 vs Function2 类型不匹配
+		UTSAndroid.requestSystemPermission(activity!, [
+			"android.permission.ACCESS_FINE_LOCATION",
+			"android.permission.ACCESS_COARSE_LOCATION"
+		], (allRight : boolean, _granted : Array<string>) => {
+			resolve(allRight)
+		}, (_doNotAskAgain : boolean, _granted : Array<string>) => {
+			resolve(false)
+		})
+	})
+}
+
+/** 申请通知权限（Android 13+ 前台服务的常驻通知需要它，否则通知不显示） */
+export function requestNotificationPermission() : Promise<boolean> {
+	return new Promise((resolve, _reject) => {
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) {
+			resolve(false)
+			return
+		}
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+			resolve(true)
+			return
+		}
+		UTSAndroid.requestSystemPermission(activity!, ["android.permission.POST_NOTIFICATIONS"],
+			(allRight : boolean, _granted : Array<string>) => {
+				resolve(allRight)
+			}, (_doNotAskAgain : boolean, _granted : Array<string>) => {
+				resolve(false)
+			})
+	})
+}
+
+/**
+ * 预热：提前创建高德 client（只构造 + 隐私合规，不启动定位，不会弹权限）。
+ * 能省掉首次点定位时的 SDK 初始化时间。
+ */
+export function prepare() : void {
+	ensureClient()
+}
+
+/** 单次定位（返回精度最高的一次） */
+export function once(options : TdybAmapOnceOptions) : void {
+	const c = ensureClient()
+	const opt = baseOption()
+
+	let latest : boolean = true
+	if (options.onceLatest != null) latest = options.onceLatest!
+	opt.setOnceLocation(true)
+	opt.setOnceLocationLatest(latest)
+
+	let needAddress : boolean = false
+	if (options.needAddress != null) needAddress = options.needAddress!
+	opt.setNeedAddress(needAddress)
+
+	let timeout : number = 10000
+	if (options.httpTimeout != null) timeout = options.httpTimeout!
+	opt.setHttpTimeOut(timeout.toLong())
+
+	onceOpts = options
+	// 注意：这里不清 streamOpts —— 持续定位在跑时插一次单次定位，不能把流打断
+	c.setLocationOption(opt)
+	c.startLocation()
+}
+
+/** 持续定位。interval 单位 ms，高德要求 >= 1000 */
+export function start(options : TdybAmapStartOptions) : void {
+	const c = ensureClient()
+	const opt = baseOption()
+
+	let interval : number = 2000
+	if (options.interval != null) interval = options.interval!
+	if (interval < 1000) interval = 1000
+	opt.setInterval(interval.toLong())
+	opt.setOnceLocation(false)
+
+	let needAddress : boolean = false
+	if (options.needAddress != null) needAddress = options.needAddress!
+	opt.setNeedAddress(needAddress)
+
+	streamOpts = options
+	streamOption = opt
+	onceOpts = null
+	c.setLocationOption(opt)
+	c.startLocation()
+}
+
+/** 停止定位（保留 client，下次 start 直接复用） */
+export function stop() : void {
+	onceOpts = null
+	streamOpts = null
+	streamOption = null
+	if (client != null) {
+		try {
+			client!.stopLocation()
+		} catch (e) {
+		}
+	}
+}
+
+/** 是否正在持续定位 */
+export function isStarted() : boolean {
+	return streamOpts != null
+}
+
+/** 释放资源，页面销毁时调用 */
+export function destroy() : void {
+	stop()
+	disableBackground()
+	if (client != null) {
+		try {
+			client!.onDestroy()
+		} catch (e) {
+		}
+		client = null
+	}
+	listener = null
+}
+
+/* ------------------------------ 后台定位 / 保活 ------------------------------ */
+/*
+ * 切后台还能持续定位需要三件事，缺一不可：
+ *   1) 运行时拿到 ACCESS_BACKGROUND_LOCATION（Android 10 弹窗 / 11+ 必须去设置页手动改）
+ *   2) 前台服务 + 常驻通知，避免进程被系统回收（直接用高德 SDK 的 enableBackgroundLocation）
+ *   3) 尽量让系统忽略电池优化（国产 ROM 还要单独开自启动/后台运行）
+ */
+
+const KEEP_CHANNEL_ID : string = "tdyb_location"
+const KEEP_CHANNEL_NAME : string = "持续定位"
+const KEEP_NOTIFICATION_ID : number = 1101
+
+let bgEnabled : boolean = false
+
+function ensureKeepChannel(ctx : Context) : void {
+	if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+		try {
+			const mgr = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+			const channel = new NotificationChannel(KEEP_CHANNEL_ID, KEEP_CHANNEL_NAME,
+				NotificationManager.IMPORTANCE_LOW)
+			channel.setShowBadge(false)
+			channel.setDescription("持续定位期间保持后台运行")
+			mgr.createNotificationChannel(channel)
+		} catch (e) {
+		}
+	}
+}
+
+function buildKeepNotification(ctx : Context, title : string, text : string) : Notification {
+	const builder = new NotificationCompatBuilder(ctx, KEEP_CHANNEL_ID)
+		.setContentTitle(title)
+		.setContentText(text)
+		.setSmallIcon(android.R.drawable.ic_menu_mylocation)
+		.setOngoing(true)
+		.setOnlyAlertOnce(true)
+		.setPriority(NotificationManager.IMPORTANCE_LOW)
+
+	const activity = UTSAndroid.getUniActivity()
+	if (activity != null) {
+		const intent = new Intent(ctx, activity!.javaClass)
+		intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP)
+		const pending = PendingIntent.getActivity(ctx, KEEP_NOTIFICATION_ID.toInt(), intent,
+			PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE)
+		builder.setContentIntent(pending)
+	}
+	return builder.build()
+}
+
+/** 开启后台定位：高德 SDK 会拉起自己的前台服务并挂常驻通知 */
+export function enableBackground(title : string, text : string) : void {
+	// 重复 start 时不要反复建通知/重启服务
+	if (bgEnabled) return
+	try {
+		const ctx = appContext()
+		ensureKeepChannel(ctx)
+		const c = ensureClient()
+		const n = buildKeepNotification(ctx, title, text)
+		c.enableBackgroundLocation(KEEP_NOTIFICATION_ID.toInt(), n)
+		bgEnabled = true
+		console.log("[tdyb-amap] 后台定位已开启")
+	} catch (e) {
+		// targetSdk 34 + 老版高德 SDK 可能因 foregroundServiceType 报错，降到 33 或升级 SDK
+		console.error("[tdyb-amap] 开启后台定位失败", e)
+	}
+}
+
+export function disableBackground() : void {
+	if (!bgEnabled) return
+	try {
+		client!.disableBackgroundLocation(true)
+	} catch (e) {
+	}
+	bgEnabled = false
+}
+
+/** 是否已拿到「始终允许」定位权限 */
+export function checkBackgroundPermission() : boolean {
+	try {
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return true
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) return false
+		return activity.checkSelfPermission("android.permission.ACCESS_BACKGROUND_LOCATION") ==
+			PackageManager.PERMISSION_GRANTED
+	} catch (e) {
+		return false
+	}
+}
+
+/**
+ * 申请后台定位权限。
+ * Android 10：直接弹窗；Android 11+：系统不允许直接申请，只能跳到应用详情页让用户手动改成「始终允许」。
+ * 返回 false 表示「已把用户引导到设置页」，不是失败。
+ */
+export function requestBackgroundPermission() : Promise<boolean> {
+	return new Promise((resolve, _reject) => {
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) {
+			resolve(false)
+			return
+		}
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+			resolve(true)
+			return
+		}
+		if (checkBackgroundPermission()) {
+			resolve(true)
+			return
+		}
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+			try {
+				const intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+				intent.setData(Uri.fromParts("package", activity!.getPackageName(), null))
+				activity!.startActivity(intent)
+			} catch (e) {
+			}
+			resolve(false)
+			return
+		}
+		UTSAndroid.requestSystemPermission(activity!, ["android.permission.ACCESS_BACKGROUND_LOCATION"],
+			(allRight : boolean, _granted : Array<string>) => {
+				resolve(allRight)
+			}, (_doNotAskAgain : boolean, _granted : Array<string>) => {
+				resolve(false)
+			})
+	})
+}
+
+/** 是否已忽略电池优化 */
+export function isIgnoringBatteryOptimizations() : boolean {
+	try {
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+		const ctx = appContext()
+		const pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+		return pm.isIgnoringBatteryOptimizations(ctx.getPackageName())
+	} catch (e) {
+		return false
+	}
+}
+
+/** 跳系统弹窗申请忽略电池优化（需要 manifest 里声明 REQUEST_IGNORE_BATTERY_OPTIMIZATIONS） */
+export function requestIgnoreBatteryOptimizations() : void {
+	try {
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+		const intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+		intent.setData(Uri.parse("package:" + activity!.getPackageName()))
+		activity!.startActivity(intent)
+	} catch (e) {
+	}
+}

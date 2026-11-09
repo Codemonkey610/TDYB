@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        高德 Android SDK key（新申请的）。
+        申请时填的「包名」必须等于 manifest.json 里的 packagename（com.kingtop.xasjcj），
+        「SHA1」必须等于打包证书的指纹（云证书），否则定位返回 errorCode=15。
+
+        改这里之后必须重新打包（云打包 / 自定义基座），热更新不生效。
+    -->
+    <application>
+        <meta-data
+            android:name="com.amap.api.v2.apikey"
+            android:value="549dc4b190853f00c8d0883913e138ec" />
+
+        <!--
+            高德定位 SDK 必需：不声明这个 service，SDK 只能返回缓存位置，
+            真正启动定位会报 #1003「定位服务启动失败 … manifest中service标签是否配置」。
+            Android 14 (targetSdk 34) 还要标 foregroundServiceType，否则 startForeground 会抛 SecurityException。
+        -->
+        <service
+            android:name="com.amap.api.location.APSService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="location" />
+    </application>
+
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_LOCATION_EXTRA_COMMANDS" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 后台/前台服务定位（需要持续定位在后台跑时才用得上；不用可以删） -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Android 13+ 前台服务的常驻通知需要 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+</manifest>

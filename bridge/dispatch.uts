@@ -1,0 +1,127 @@
+/**
+ * 消息分发：网页 postMessage 上来一个对象 → 找到对应处理方法。
+ *
+ * 官方约定（uni-app x web-view）：
+ *   网页：window.__uniapp_x_postMessage({ data: { method, message, key } })
+ *   壳：  <web-view @message> 的 event.detail.data 是 Array<UTSJSONObject>，
+ *         数组里每一项就是网页 post 的那个 data 对象。
+ *
+ * 去重：同一条消息理论上只会到一次，但页面内可能重复 post，按 key 做 5 秒窗口去重。
+ */
+
+import {
+	M_PRECISE,
+	M_QUICK,
+	M_START,
+	M_CLOSE,
+	M_OPEN_SETTING,
+	M_SET_MODE,
+	M_GET_MODE
+} from './protocol.uts'
+import {
+	handlePrecise,
+	handleQuick,
+	handleStart,
+	handleClose,
+	handleOpenSetting,
+	setMode,
+	getMode
+} from './location.uts'
+import { replyError } from './reply.uts'
+
+const DEDUPE_WINDOW : number = 5000
+const DEDUPE_MAX : number = 200
+
+let recentKeys : string[] = []
+let recentTimes : number[] = []
+
+function alreadyHandled(key : string) : boolean {
+	if (key == "") return false
+	const now = Date.now()
+	let i = 0
+	while (i < recentKeys.length) {
+		if (now - recentTimes[i] > DEDUPE_WINDOW) {
+			recentKeys.splice(i, 1)
+			recentTimes.splice(i, 1)
+			continue
+		}
+		if (recentKeys[i] == key) return true
+		i++
+	}
+	if (recentKeys.length >= DEDUPE_MAX) {
+		recentKeys.splice(0, 1)
+		recentTimes.splice(0, 1)
+	}
+	recentKeys.push(key)
+	recentTimes.push(now)
+	return false
+}
+
+/**
+ * 取出 message 字段。
+ *
+ * 注意：UTS 里 `any` 编译成 Kotlin 的非空 `Any`，而 `UTSJSONObject.get()`
+ * 返回的是可空的 `Any?`，所以不能写成 `asMessage(raw : any)` 再把 get() 结果传进去
+ * （会报 "actual type is 'Any?', but 'Any' was expected"）。
+ * 这里改成直接收 obj，内部用 instanceof / getString 处理可空值。
+ */
+function asMessage(obj : UTSJSONObject) : UTSJSONObject | null {
+	const raw = obj.get("message")
+	if (raw instanceof UTSJSONObject) return raw as UTSJSONObject
+
+	// 兼容 message 被序列化成 JSON 字符串的情况
+	const text = obj.getString("message")
+	if (text != null && text != "") {
+		try {
+			const parsed = JSON.parse(text)
+			if (parsed instanceof UTSJSONObject) return parsed as UTSJSONObject
+		} catch (e) {
+			return null
+		}
+	}
+	return null
+}
+
+/** 处理一条网页消息（event.detail.data 里的一个元素） */
+export function dispatchMessage(obj : UTSJSONObject) : void {
+	const method = obj.getString("method") ?? ""
+	const key = obj.getString("key") ?? ""
+	if (method == "") return
+	if (alreadyHandled(key)) return
+
+	// 自检探针：壳注入的脚本用它回报「网页里哪个桥可用」
+	if (method == "__probe") {
+		console.log("[TDYB] 桥可用 = " + (obj.getString("channel") ?? "?"))
+		return
+	}
+
+	console.log("[TDYB] 收到消息 " + method + " key=" + key)
+	const message = asMessage(obj)
+
+	switch (method) {
+		case M_PRECISE:
+			handlePrecise(message, key)
+			break
+		case M_QUICK:
+			handleQuick(message, key)
+			break
+		case M_START:
+			handleStart(message, key)
+			break
+		case M_CLOSE:
+			handleClose(key)
+			break
+		case M_OPEN_SETTING:
+			handleOpenSetting(key)
+			break
+		case M_SET_MODE:
+			setMode((message == null ? "GPS" : (message!.getString("mode") ?? "GPS")), key)
+			break
+		case M_GET_MODE:
+			getMode(key)
+			break
+		default:
+			replyError(key, "壳不支持的方法: " + method)
+			break
+	}
+}

@@ -1,0 +1,23 @@
+/**
+ * 新壳全局配置。改这里即可，不用动页面与桥接代码。
+ */
+
+/** 内嵌的 Vue 站点地址（部署在哪就写哪，改完需重新打包） */
+export const FRONTEND_URL = "http://36.248.211.159:8017/"
+
+/** 定位回传节奏：前端没传 interval 时的默认值（ms） */
+export const DEFAULT_INTERVAL = 2000
+
+/** 允许前端传入的 interval 区间（ms），超出即钳制 */
+export const MIN_INTERVAL = 1000
+export const MAX_INTERVAL = 10000
+
+/** 单次定位整体超时（ms），超时给前端回 fail，避免前端一直转圈 */
+export const ONCE_TIMEOUT = 6000
+
+/**
+ * 高德 Android SDK key 兜底。
+ * 更推荐写进 uni_modules/tdyb-amap-location/utssdk/app-android/AndroidManifest.xml
+ * 的 com.amap.api.v2.apikey；两处都配时以 manifest 为准，这里非空则运行时再 setApiKey 覆盖。
+ */
+export const AMAP_KEY = ""

@@ -1,0 +1,165 @@
+<template>
+	<view class="page">
+		<!-- 顶部安全区 + 标题栏，只有一个 RTK设置 按钮 -->
+		<view class="header" :style="headerStyle">
+			<view class="header-bar">
+				<view class="header-btn" @click="onRtkSetting">
+					<text class="header-btn-text">RTK设置</text>
+				</view>
+			</view>
+		</view>
+
+		<web-view
+			id="tdybWeb"
+			class="wv"
+			:src="src"
+			@message="onWebMessage"
+			@load="onPageLoad"
+			@error="onWebError"
+		></web-view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	/**
+	 * 新壳的唯一页面：安全区头部 + 全屏 web-view + 定位桥。
+	 *
+	 * 通信（uni-app x 官方通道，实测 web-view 注入的是对象形态）：
+	 *   网页 → 壳：window.__uniapp_x_.postMessage(JSON.stringify({ data: { method, message, key } }))
+	 *             壳侧 @message 的 event.detail.data 是 Array<UTSJSONObject>
+	 *   壳 → 网页：evalJS('window["key"] = "<json>"')（单向，无返回值）
+	 *
+	 * 不注入任何垫片：前端直接调 __uniapp_x_，不需要额外兼容层。
+	 * evalJS 没有返回值/回调，所以所有上行都必须由网页 postMessage 驱动。
+	 */
+	import { FRONTEND_URL } from '@/utils/config.uts'
+	import { bindWebView, unbindWebView, execJS } from '@/bridge/webview.uts'
+	import { dispatchMessage } from '@/bridge/dispatch.uts'
+	import { stopAll, warmUp } from '@/bridge/location.uts'
+
+	const src = ref(FRONTEND_URL)
+
+	// 顶部安全区：状态栏高度（拿不到就用系统给的值）
+	const sysInfo = uni.getSystemInfoSync()
+	let topInset : number = sysInfo.statusBarHeight
+	const insets = sysInfo.safeAreaInsets
+	if (insets.top > 0) topInset = insets.top
+
+	const headerStyle = "padding-top:" + topInset.toString() + "px;"
+
+	let backAt : number = 0
+
+	/* ------------------------- 头部按钮 ------------------------- */
+
+	function onRtkSetting() : void {
+		uni.navigateTo({ url: "/pages/rtk-setting/rtk-setting" })
+	}
+
+	/* ------------------------- 事件 ------------------------- */
+
+	function onWebMessage(event : UniWebViewMessageEvent) : void {
+		const list = event.detail.data
+		for (let i = 0; i < list.length; i++) {
+			dispatchMessage(list[i])
+		}
+	}
+
+	/**
+	 * 自检探针：页面加载完后用真实通道发一条 __probe 上来，
+	 * 壳日志会打 `桥可用 = xxx`，用来确认「网页能不能发到壳」。
+	 *
+	 * 注意：uvue 的 `<script setup>` 会被编成 Kotlin 局部函数，
+	 * 局部函数必须"先声明后使用"，所以这个函数要放在 onPageLoad 之前。
+	 */
+	function probeBridge() : void {
+		execJS("(function(){try{" +
+			"if(window.__uniapp_x_&&typeof window.__uniapp_x_.postMessage==='function'){window.__uniapp_x_.postMessage(JSON.stringify({data:{method:'__probe',channel:'uniapp_x_'}}));return}" +
+			"if(typeof window.__uniapp_x_postMessage==='function'){window.__uniapp_x_postMessage({data:{method:'__probe',channel:'uniapp_x_postMessage'}});return}" +
+			"}catch(e){}})()")
+		console.log("[TDYB] probe 已注入，等待回执（3 秒内没有『桥可用』就是没注入）")
+	}
+
+	function onPageLoad(_event : UniWebViewLoadEvent) : void {
+		// 页面（含刷新）加载完成。通信不依赖任何注入，这里只留日志 + 一条自检探针
+		console.log("[TDYB] web-view 加载完成")
+		probeBridge()
+	}
+
+	function onWebError(event : UniWebViewErrorEvent) : void {
+		const detail = event.detail
+		console.error("[TDYB] web-view error: " + detail.errMsg + " url=" + detail.url)
+		uni.showToast({ title: "页面加载失败：" + detail.errMsg, position: "bottom" })
+	}
+
+	/* ------------------------- 生命周期 ------------------------- */
+
+	onReady(() => {
+		const el = uni.getElementById("tdybWeb")
+		if (el == null) {
+			console.error("[TDYB] 找不到 id=tdybWeb 的 web-view")
+			return
+		}
+		bindWebView(el as UniWebViewElement)
+		// 预建高德 client（只构造，不启动定位、不弹权限），省掉首次点定位的初始化
+		warmUp()
+	})
+
+	onBackPress(() => {
+		const now = Date.now()
+		if (now - backAt < 2000) {
+			uni.exit()
+			return true
+		}
+		backAt = now
+		// 先让页面自己的 router 后退；退不动就提示再按一次退出
+		execJS("(function(){try{history.back()}catch(e){}})()")
+		uni.showToast({ title: "再按一次退出", position: "bottom" })
+		return true
+	})
+
+	onUnload(() => {
+		stopAll()
+		unbindWebView()
+	})
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		width: 100%;
+		height: 100%;
+		background-color: #ffffff;
+	}
+
+	.header {
+		background-color: #ffffff;
+		border-bottom-width: 1px;
+		border-bottom-style: solid;
+		border-bottom-color: #e5e7eb;
+	}
+
+	.header-bar {
+		height: 44px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: flex-end;
+		padding-left: 16px;
+		padding-right: 8px;
+	}
+
+	.header-btn {
+		padding: 6px 12px;
+		border-radius: 14px;
+		background-color: #1677ff;
+	}
+
+	.header-btn-text {
+		font-size: 13px;
+		color: #ffffff;
+	}
+
+	.wv {
+		flex: 1;
+		width: 100%;
+	}
+</style>

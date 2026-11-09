@@ -1,0 +1,186 @@
+<template>
+	<view class="page">
+		<view class="header" :style="headerStyle">
+			<view class="header-bar">
+				<view class="back" @click="goBack">
+					<text class="back-text">返回</text>
+				</view>
+				<text class="title">RTK 设置</text>
+				<view class="back" style="opacity:0">
+					<text class="back-text">返回</text>
+				</view>
+			</view>
+		</view>
+
+		<scroll-view class="body" :scroll-y="true">
+			<view class="card">
+				<text class="card-title">定位服务</text>
+				<text class="row-text">高德定位（GCJ02），回传前自动转 WGS84</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">后台定位权限</text>
+				<text class="row-text">{{ bgText }}</text>
+				<view class="btn" @click="onBackgroundPermission">
+					<text class="btn-text">去设置「始终允许」</text>
+				</view>
+			</view>
+
+			<view class="card">
+				<text class="card-title">电池优化</text>
+				<text class="row-text">{{ batteryText }}</text>
+				<view class="btn" @click="onBattery">
+					<text class="btn-text">允许忽略电池优化</text>
+				</view>
+			</view>
+
+			<view class="card">
+				<text class="card-title">RTK 设备</text>
+				<text class="row-text">当前版本只使用手机高德定位，RTK 硬件（蓝牙/TCP + NMEA）尚未接入。</text>
+				<text class="row-tip">接入后：fixStatus 会返回 fixed/float，自动记录的精度门限可以收紧到 5cm。</text>
+			</view>
+		</scroll-view>
+	</view>
+</template>
+
+<script setup lang="uts">
+	import {
+		checkBackgroundPermission,
+		requestBackgroundPermission,
+		isIgnoringBatteryOptimizations,
+		requestIgnoreBatteryOptimizations
+	} from '@/uni_modules/tdyb-amap-location'
+
+	const sysInfo = uni.getSystemInfoSync()
+	let topInset : number = sysInfo.statusBarHeight
+	const insets = sysInfo.safeAreaInsets
+	if (insets.top > 0) topInset = insets.top
+
+	const headerStyle = "padding-top:" + topInset.toString() + "px;"
+
+	const bgOk = ref(false)
+	const batteryOk = ref(false)
+
+	const bgText = computed(() : string => {
+		return bgOk.value ? "已允许（始终允许）" : "未允许，切后台后可能被系统掐断"
+	})
+
+	const batteryText = computed(() : string => {
+		return batteryOk.value ? "已忽略电池优化" : "未忽略，长时间后台可能被清理"
+	})
+
+	function refreshState() : void {
+		try {
+			bgOk.value = checkBackgroundPermission()
+			batteryOk.value = isIgnoringBatteryOptimizations()
+		} catch (e) {
+			console.warn("[TDYB] 读取系统设置状态失败", e)
+		}
+	}
+
+	function goBack() : void {
+		uni.navigateBack()
+	}
+
+	function onBackgroundPermission() : void {
+		requestBackgroundPermission()
+		// 用户在设置页改完回来再刷新
+		setTimeout(() => {
+			refreshState()
+		}, 1500)
+	}
+
+	function onBattery() : void {
+		requestIgnoreBatteryOptimizations()
+		setTimeout(() => {
+			refreshState()
+		}, 1500)
+	}
+
+	onShow(() => {
+		refreshState()
+	})
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		width: 100%;
+		height: 100%;
+		background-color: #f5f6f8;
+	}
+
+	.header {
+		background-color: #ffffff;
+		border-bottom-width: 1px;
+		border-bottom-style: solid;
+		border-bottom-color: #e5e7eb;
+	}
+
+	.header-bar {
+		height: 44px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding-left: 8px;
+		padding-right: 8px;
+	}
+
+	.back {
+		padding: 6px 10px;
+	}
+
+	.back-text {
+		font-size: 15px;
+		color: #1677ff;
+	}
+
+	.title {
+		font-size: 16px;
+		color: #111827;
+	}
+
+	.body {
+		flex: 1;
+		padding: 12px;
+	}
+
+	.card {
+		background-color: #ffffff;
+		border-radius: 10px;
+		padding: 14px;
+		margin-bottom: 12px;
+	}
+
+	.card-title {
+		font-size: 15px;
+		font-weight: bold;
+		color: #111827;
+		margin-bottom: 8px;
+	}
+
+	.row-text {
+		font-size: 13px;
+		color: #4b5563;
+		margin-bottom: 6px;
+	}
+
+	.row-tip {
+		font-size: 12px;
+		color: #9ca3af;
+	}
+
+	.btn {
+		margin-top: 8px;
+		height: 38px;
+		border-radius: 8px;
+		background-color: #1677ff;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.btn-text {
+		font-size: 14px;
+		color: #ffffff;
+	}
+</style>

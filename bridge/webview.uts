@@ -1,0 +1,35 @@
+/**
+ * web-view 的 evalJS 适配层。
+ *
+ * 官方签名（HBuilderX builtin-dts / types/native/IUniElement.d.ts:6454）：
+ *   evalJS(js: string): void
+ * 注意：
+ *   1) 名字是大写 JS；
+ *   2) 没有返回值、也没有回调 —— 所以「壳取网页数据」只能靠网页主动 postMessage，
+ *      不能靠 evalJS 轮询（那套兜底方案已删除）。
+ */
+
+let webview : UniWebViewElement | null = null
+
+export function bindWebView(el : UniWebViewElement) : void {
+	webview = el
+}
+
+export function unbindWebView() : void {
+	webview = null
+}
+
+export function isBound() : boolean {
+	return webview != null
+}
+
+/** 单向执行 JS（写回 window[key]、页面内后退等） */
+export function execJS(js : string) : void {
+	const el = webview
+	if (el == null) return
+	try {
+		el!.evalJS(js)
+	} catch (e) {
+		console.warn("[TDYB] evalJS 执行失败（页面可能还没加载完）")
+	}
+}

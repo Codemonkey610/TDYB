@@ -1,0 +1,36 @@
+/**
+ * 回写结果给页面。
+ *
+ * 协议：window[key] = "<JSON 字符串>"
+ * 与旧壳 msgRes(key, value) 的行为一致：Vue 侧在 Object.defineProperty 的 setter 里收到。
+ */
+import { execJS } from './webview.uts'
+
+/** 直接把 payload（已经是 JSON 字符串）写回页面 */
+export function replyRaw(key : string, payload : string) : void {
+	if (key == "") return
+	// JSON.stringify(key) → JS 字符串字面量；JSON.stringify(payload) → 转义好的字符串字面量
+	const js = "window[" + JSON.stringify(key) + "]=" + JSON.stringify(payload) + ";"
+	execJS(js)
+	console.log("[TDYB] 回写 " + key + " len=" + payload.length.toString())
+}
+
+/** 回写一个对象 */
+export function replyJson(key : string, obj : UTSJSONObject) : void {
+	replyRaw(key, JSON.stringify(obj))
+}
+
+/** 回写一个字符串值（会变成 JSON 字符串字面量，Vue 侧 JSON.parse 得到原字符串） */
+export function replyText(key : string, text : string) : void {
+	replyRaw(key, JSON.stringify(text))
+}
+
+/**
+ * 回写失败。
+ * Vue 的 responseExec 看到 result.fail 为真就判定失败，并把 fail 的值作为 err 传给 fail 回调。
+ */
+export function replyError(key : string, msg : string) : void {
+	const obj : UTSJSONObject = { "fail": msg }
+	replyJson(key, obj)
+	console.warn("[TDYB] 定位失败: " + msg)
+}

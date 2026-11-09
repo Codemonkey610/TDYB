@@ -1,0 +1,32 @@
+/**
+ * 与 Vue 侧约定的桥接协议。
+ *
+ * 协议来源：TDYB_VUE/frontend/src/bridge/location.ts
+ *   页面 → 壳：{ method, message, key }
+ *   壳 → 页面：window[key] = JSON 字符串
+ *
+ * 这 7 个 method 名必须与 Vue 侧调用完全一致，不要改名。
+ */
+
+/** 单次高精度定位（Vue: getPreciseLocation） */
+export const M_PRECISE = "getPreciseLocation"
+
+/** 单次快速定位（Vue: getLocationQuickly） */
+export const M_QUICK = "getLocationQuickly"
+
+/** 开启持续定位流（Vue: startGetLocationService） */
+export const M_START = "startGetLocationService"
+
+/** 关闭持续定位流（Vue: closeGetLocationService） */
+export const M_CLOSE = "closeGetLocationService"
+
+/** 打开定位设置页（Vue: openLocationSetting） */
+export const M_OPEN_SETTING = "openLocationSetting"
+
+/** 定位模式读写（旧壳保留，Vue 暂未调用） */
+export const M_SET_MODE = "setLocationMode"
+export const M_GET_MODE = "getLocationMode"
+
+/** 坐标系 */
+export const COORD_WGS84 = "wgs84"
+export const COORD_GCJ02 = "gcj02"

@@ -19,6 +19,7 @@ import {
 } from '@/utils/config.uts'
 import { COORD_WGS84, COORD_GCJ02 } from './protocol.uts'
 import { replyJson, replyError, replyText } from './reply.uts'
+import { rtkIsActive, startRtkStream, stopRtkStream, rtkOnce } from './rtk.uts'
 import { gcj02ToWgs84, distanceM } from '@/utils/coord.uts'
 import {
 	once as amapOnce,
@@ -193,6 +194,12 @@ export function handlePrecise(message : UTSJSONObject | null, key : string) : vo
 	const coord = readCoord(message)
 	const needAddress = readBool(message, "geocode", readBool(message, "needAddress", false))
 
+	// 用户选了 RTK 且已连接 → 直接用 RTK（WGS84，无需高德）
+	if (shouldUseRtk()) {
+		rtkOnce(key, coord, 3000)
+		return
+	}
+
 	if (replyFreshIfStreaming(key, coord)) return
 
 	// 3 秒内刚定位过 → 直接给缓存，点一下秒回
@@ -259,6 +266,12 @@ export function handlePrecise(message : UTSJSONObject | null, key : string) : vo
 export function handleQuick(message : UTSJSONObject | null, key : string) : void {
 	const coord = readCoord(message)
 	const needAddress = readBool(message, "geocode", false)
+
+	// RTK 模式已连接 → 快速定位也优先走 RTK（更快更准，不走高德）
+	if (shouldUseRtk()) {
+		rtkOnce(key, coord, 3000)
+		return
+	}
 
 	if (replyFreshIfStreaming(key, coord)) return
 
@@ -359,6 +372,15 @@ export function handleStart(message : UTSJSONObject | null, key : string) : void
 	streamInterval = clampInterval(readNumber(message, "interval", DEFAULT_INTERVAL))
 	const needAddress = readBool(message, "needAddress", false)
 
+	// RTK 模式已连接 → 走 RTK 持续流，不动高德 SDK
+	if (shouldUseRtk()) {
+		streaming = true
+		lastSentAt = 0
+		startRtkStream(key, streamCoord)
+		console.log("[TDYB] 使用 RTK 持续定位")
+		return
+	}
+
 	ensurePermission().then((ok : boolean) => {
 		if (!ok) {
 			replyError(key, "未授予定位权限，持续定位无法启动")
@@ -429,34 +451,61 @@ export function handleClose(key : string) : void {
 	streamKey = ""
 	lastSentAt = 0
 	amapStop()
+	stopRtkStream()
 	disableBackground()
 	replyText(key, "关闭成功")
 	console.log("[TDYB] 持续定位已停止")
 }
 
+/* ------------------------------ 定位源模式 ------------------------------ */
+
+/** 定位源模式常量：rtk = RTK 定位，amap = 手机（高德）定位 */
+export const MODE_RTK = "rtk"
+export const MODE_AMAP = "amap"
+
+/**
+ * 读取用户选择的定位源模式。
+ * 默认 RTK（历史行为：连上 RTK 就优先用 RTK），但允许用户显式切到「手机定位」。
+ */
+export function currentMode() : string {
+	const mode = uni.getStorageSync("LocationMode")
+	let text : string = MODE_RTK
+	if (mode != null) {
+		const s = mode.toString()
+		if (s == MODE_AMAP) text = MODE_AMAP
+		else if (s == MODE_RTK) text = MODE_RTK
+	}
+	return text
+}
+
+/**
+ * 当前定位是否应走 RTK：用户选了 RTK 模式，且 RTK 已连接。
+ * 用户显式选「手机定位」时，即使 RTK 还连着也一律走高德。
+ */
+function shouldUseRtk() : boolean {
+	return currentMode() == MODE_RTK && rtkIsActive()
+}
+
 /* ------------------------------ 设置 / 生命周期 ------------------------------ */
 
-/** Vue：openLocationSetting() —— 新壳只有高德定位，没有 RTK 设置页 */
+/** Vue：openLocationSetting() —— 打开 RTK 设置页（蓝牙/WiFi 连接 RTK） */
 export function handleOpenSetting(key : string) : void {
 	const ok : UTSJSONObject = { "success": true }
 	replyJson(key, ok)
-	uni.showToast({ title: "当前为高德定位模式", position: "bottom" })
+	uni.navigateTo({ url: "/pages/rtk-setting/rtk-setting" })
 }
 
 export function setMode(mode : string, key : string) : void {
-	uni.setStorageSync("LocationMode", mode)
-	const ok : UTSJSONObject = { "success": true }
+	// 归一化：只接受 rtk / amap，其余忽略（写回当前值）
+	let v = mode
+	if (v != MODE_RTK && v != MODE_AMAP) v = currentMode()
+	uni.setStorageSync("LocationMode", v)
+	const ok : UTSJSONObject = { "success": true, "mode": v }
 	replyJson(key, ok)
 }
 
 export function getMode(key : string) : void {
-	// getStorageSync 返回的是可空 Any，先落到 string 再回写，避免 Any? 直接参与表达式
-	const mode = uni.getStorageSync("LocationMode")
-	let text : string = "GPS"
-	if (mode != null) {
-		text = mode.toString()
-	}
-	replyText(key, text)
+	replyText(key, currentMode())
 }
 
 /** 页面销毁时兜底 */
@@ -464,6 +513,7 @@ export function stopAll() : void {
 	streaming = false
 	streamKey = ""
 	amapStop()
+	stopRtkStream()
 	disableBackground()
 	amapDestroy()
 }

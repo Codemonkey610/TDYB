@@ -13,92 +13,790 @@
 		</view>
 
 		<scroll-view class="body" :scroll-y="true">
+			<!-- 定位源选择：手机定位（高德）/ RTK 定位 -->
 			<view class="card">
-				<text class="card-title">定位服务</text>
-				<text class="row-text">高德定位（GCJ02），回传前自动转 WGS84</text>
+				<text class="card-title">定位源</text>
+				<view class="tabs">
+					<view class="tab" :class="{ 'tab-active': locSource == 'amap' }" @click="switchSource('amap')">
+						<text class="tab-text">手机定位</text>
+					</view>
+					<view class="tab" :class="{ 'tab-active': locSource == 'rtk' }" @click="switchSource('rtk')">
+						<text class="tab-text">RTK 定位</text>
+					</view>
+				</view>
+				<text class="row-tip" style="margin-top:8px;">{{ locSource == 'amap' ? '使用手机高德定位，始终走手机定位。' : '连接 RTK 后优先使用 RTK 高精度定位。' }}</text>
 			</view>
 
+			<!-- 手机定位模式：只提示说明 -->
+			<template v-if="locSource == 'amap'">
+				<view class="card">
+					<text class="card-title">手机定位（高德）</text>
+					<text class="row-text">当前定位源为手机定位，网页侧所有定位请求都将使用高德定位。</text>
+					<text class="row-tip">如需使用 RTK 高精度定位，请在上方切换到「RTK 定位」。</text>
+				</view>
+			</template>
+
+			<!-- RTK 定位模式：连接方式切换 + 连接/定位信息 -->
+			<template v-if="locSource == 'rtk'">
+			<!-- 连接方式切换 -->
 			<view class="card">
-				<text class="card-title">后台定位权限</text>
-				<text class="row-text">{{ bgText }}</text>
-				<view class="btn" @click="onBackgroundPermission">
-					<text class="btn-text">去设置「始终允许」</text>
+				<view class="tabs">
+					<view class="tab" :class="{ 'tab-active': mode == 'bluetooth' }" @click="switchMode('bluetooth')">
+						<text class="tab-text">蓝牙</text>
+					</view>
+					<view class="tab" :class="{ 'tab-active': mode == 'wifi' }" @click="switchMode('wifi')">
+						<text class="tab-text">WiFi / TCP</text>
+					</view>
 				</view>
 			</view>
 
-			<view class="card">
-				<text class="card-title">电池优化</text>
-				<text class="row-text">{{ batteryText }}</text>
-				<view class="btn" @click="onBattery">
-					<text class="btn-text">允许忽略电池优化</text>
+			<!-- 蓝牙模式 -->
+			<template v-if="mode == 'bluetooth' && !connected">
+				<view class="card">
+					<view class="card-head">
+						<text class="card-title">可用设备</text>
+						<view class="btn-sm" @click="onScanBluetooth">
+							<text class="btn-sm-text">{{ scanning ? '扫描中…' : '开始扫描' }}</text>
+						</view>
+					</view>
+					<view v-if="bluetoothDevices.length == 0" class="empty">
+						<text class="empty-text">{{ scanning ? '正在扫描附近蓝牙设备…' : '未发现设备，点击「开始扫描」' }}</text>
+					</view>
+					<view v-for="item in bluetoothDevices" :key="item.address" class="device" @click="onConnectBluetooth(item)">
+						<view class="device-main">
+							<text class="device-name">{{ item.name }}</text>
+							<text class="device-addr">{{ item.address }}</text>
+						</view>
+						<text class="device-badge" v-if="item.bondState == 12">已配对</text>
+						<text class="device-connect">连接</text>
+					</view>
 				</view>
-			</view>
+			</template>
 
+			<!-- WiFi/TCP 模式 -->
+			<template v-if="mode == 'wifi' && !connected">
+				<view class="card">
+					<view class="card-head">
+						<text class="card-title">当前 WiFi</text>
+						<view class="btn-sm" @click="onOpenWifiSettings">
+							<text class="btn-sm-text">WiFi 设置</text>
+						</view>
+					</view>
+					<text class="row-text">SSID：{{ wifiSsidText }}</text>
+					<text class="row-text">本机 IP：{{ wifiIpText }}</text>
+					<text class="row-text">{{ wifiMatchText }}</text>
+					<text v-if="!hasConnectable" class="row-tip">请将 WIFI 连接到对应的设备</text>
+				</view>
+
+				<view class="card">
+					<text class="card-title">设备清单</text>
+					<view v-for="item in presetDevices" :key="item.name" class="device" @click="onConnectPreset(item)">
+						<view class="device-main">
+							<text class="device-name">{{ item.name }}</text>
+							<text class="device-addr">{{ item.address }} : {{ item.port }}</text>
+						</view>
+						<text v-if="item.name == matchedName" class="device-badge">当前 WiFi</text>
+						<text v-if="item.connectivity" class="device-badge-ok">可连接</text>
+						<text v-else class="device-badge-disabled">不可连接</text>
+						<text class="device-connect" :class="{ 'device-connect-disabled': !item.connectivity }">{{ item.connectivity ? '连接' : '—' }}</text>
+					</view>
+				</view>
+
+				<view class="card">
+					<view class="card-head">
+						<text class="card-title">自动扫描</text>
+						<view class="btn-sm" @click="onScanSubnet">
+							<text class="btn-sm-text">{{ scanningSubnet ? '扫描中…' : '扫描设备' }}</text>
+						</view>
+					</view>
+					<text class="row-tip">连上 RTK 热点后点「扫描设备」，自动发现网段内开放的 RTK 端口。</text>
+					<view v-if="scannedHosts.length > 0">
+						<view v-for="h in scannedHosts" :key="h.ip" class="device" @click="onConnectScanned(h)">
+							<view class="device-main">
+								<text class="device-name">{{ h.ip }}</text>
+								<text class="device-addr">端口 {{ h.port }}</text>
+							</view>
+							<text class="device-badge-ok">可连接</text>
+							<text class="device-connect">连接</text>
+						</view>
+					</view>
+				</view>
+
+				<view class="card">
+					<text class="card-title">连接 RTK（TCP）</text>
+					<text class="row-tip">常见 RTK 热点：192.168.10.1 / 9000，或设备说明书里的 IP 与端口</text>
+					<view class="field">
+						<text class="field-label">IP 地址</text>
+						<input class="field-input" v-model="ip" placeholder="如 192.168.10.1" />
+					</view>
+					<view class="field">
+						<text class="field-label">端口</text>
+						<input class="field-input" v-model="port" placeholder="如 9000" :digit="true" />
+					</view>
+					<view class="btn-row">
+						<view class="btn" @click="onProbe">
+							<text class="btn-text">探测</text>
+						</view>
+						<view class="btn" style="margin-left:10px;" @click="onConnectTcp">
+							<text class="btn-text">连接</text>
+						</view>
+					</view>
+					<text class="row-text" style="margin-top:8px;">{{ probeText }}</text>
+				</view>
+			</template>
+
+			<!-- 已连接状态 -->
+			<template v-if="connected">
+				<view class="card">
+					<view class="card-head">
+						<text class="card-title">已连接设备</text>
+						<view class="btn-sm btn-danger" @click="onDisconnect">
+							<text class="btn-sm-text">断开连接</text>
+						</view>
+					</view>
+					<text class="row-text">{{ connectedLabel }}</text>
+					<text class="row-text">{{ mode == 'bluetooth' ? '蓝牙 SPP' : 'WiFi TCP' }}</text>
+				</view>
+
+				<view class="card">
+					<text class="card-title">实时定位数据（NMEA GGA）</text>
+					<view v-for="row in dataRows" :key="row.title" class="data-row">
+						<text class="data-title">{{ row.title }}</text>
+						<text class="data-value">{{ row.value }}</text>
+					</view>
+				</view>
+			</template>
+
+			<!-- 后台定位权限提示（沿用高德页面的引导） -->
 			<view class="card">
-				<text class="card-title">RTK 设备</text>
-				<text class="row-text">当前版本只使用手机高德定位，RTK 硬件（蓝牙/TCP + NMEA）尚未接入。</text>
-				<text class="row-tip">接入后：fixStatus 会返回 fixed/float，自动记录的精度门限可以收紧到 5cm。</text>
+				<text class="card-title">说明</text>
+				<text class="row-text">RTK 连接成功后，网页侧发起定位会自动优先使用 RTK 数据。</text>
+				<text class="row-tip">断开 RTK 后自动回退到手机高德定位。</text>
 			</view>
+			</template>
 		</scroll-view>
 	</view>
 </template>
 
 <script setup lang="uts">
 	import {
-		checkBackgroundPermission,
-		requestBackgroundPermission,
-		isIgnoringBatteryOptimizations,
-		requestIgnoreBatteryOptimizations
-	} from '@/uni_modules/tdyb-amap-location'
+		startBluetoothDiscovery,
+		stopBluetoothDiscovery,
+		connectBluetooth,
+		closeBluetoothConnection,
+		isBluetoothConnected,
+		connectTcp,
+		disconnectTcp,
+		isTcpConnected,
+		scanTcpPort,
+		scanSubnetForRtk,
+		currentSubnet,
+		getWifiDetails,
+		openWifiSettings,
+		registerDataListener,
+		unregisterDataListener,
+		requestBluetoothPermission,
+		parseGga,
+		getLastFix,
+		getLastFixAt,
+		RtkBluetoothDevice,
+		RtkWifiInfo,
+		RtkScannedHost,
+		RtkFix,
+		RtkResult
+	} from '@/uni_modules/tdyb-rtk'
+	import rtkListRaw from '@/static/rtk.json'
+
+	type PresetDevice = {
+		name : string
+		address : string
+		port : string
+		/** 运行期探测出来的结果，不是 json 里的静态值 */
+		connectivity : boolean
+	}
+	type DataRow = {
+		title : string
+		value : string
+	}
 
 	const sysInfo = uni.getSystemInfoSync()
 	let topInset : number = sysInfo.statusBarHeight
 	const insets = sysInfo.safeAreaInsets
 	if (insets.top > 0) topInset = insets.top
-
 	const headerStyle = "padding-top:" + topInset.toString() + "px;"
 
-	const bgOk = ref(false)
-	const batteryOk = ref(false)
+	// 定位源：amap = 手机定位（高德），rtk = RTK 定位
+	const locSource = ref('rtk')
 
-	const bgText = computed(() : string => {
-		return bgOk.value ? "已允许（始终允许）" : "未允许，切后台后可能被系统掐断"
-	})
+	// 连接方式（持久化，避免返回再进入时又切回默认的蓝牙）
+	const mode = ref('bluetooth')
+	const scanning = ref(false)
+	const connected = ref(false)
+	const connectedLabel = ref('')
 
-	const batteryText = computed(() : string => {
-		return batteryOk.value ? "已忽略电池优化" : "未忽略，长时间后台可能被清理"
-	})
+	// 蓝牙
+	const bluetoothDevices = ref<RtkBluetoothDevice[]>([])
 
-	function refreshState() : void {
-		try {
-			bgOk.value = checkBackgroundPermission()
-			batteryOk.value = isIgnoringBatteryOptimizations()
-		} catch (e) {
-			console.warn("[TDYB] 读取系统设置状态失败", e)
+	// WiFi
+		const wifiInfo = ref<RtkWifiInfo | null>(null)
+		const ip = ref('')
+		const port = ref('9000')
+		const probeText = ref('')
+
+		// 网段自动扫描
+		const scanningSubnet = ref(false)
+		const scannedHosts = ref<RtkScannedHost[]>([])
+
+		// 模板里对可空对象做三元判断不会被 smart cast，先算成字符串再用
+		const wifiSsidText = computed(() : string => {
+			const w = wifiInfo.value
+			return w == null ? '--' : w.ssid
+		})
+		const wifiIpText = computed(() : string => {
+			const w = wifiInfo.value
+			return w == null ? '--' : w.address
+		})
+
+		// 当前 WiFi 网段匹配到的预设设备（手机连上 RTK 热点后，两者前三段 IP 相同）
+		const matchedPreset = ref<PresetDevice | null>(null)
+		const matchedName = computed(() : string => {
+			const m = matchedPreset.value
+			return m == null ? '' : m.name
+		})
+		const wifiMatchText = computed(() : string => {
+			const m = matchedPreset.value
+			if (m == null) return '未匹配到预设设备，可在下方手动填写 IP / 端口'
+			return '识别到：' + m.name + '（' + m.address + ':' + m.port + '）'
+		})
+
+		// 内置 RTK 设备清单：从 static/rtk.json 读取（与线上清单一致），
+		// 以后更新清单只需替换 static/rtk.json 文件，无需改代码
+		const presetDevices = ref<PresetDevice[]>([])
+
+		function loadPresetDevices() : void {
+			const raw = rtkListRaw as UTSJSONObject[]
+			for (let i = 0; i < raw.length; i++) {
+				const item = raw[i]
+				const name = item.getString("name") ?? ""
+				const address = item.getString("address") ?? ""
+				const port = item.getString("port") ?? ""
+				if (name != "" && address != "") {
+					// 注意：直接 push 对象字面量会被推断成 UTSJSONObject，
+					// 必须先声明成 PresetDevice 再 push
+					const d : PresetDevice = {
+						name: name,
+						address: address,
+						port: port,
+						connectivity: false
+					}
+					presetDevices.value.push(d)
+				}
+			}
 		}
-	}
+		loadPresetDevices()
+
+		// 当前网段里是否有设备端口探测通过（没有就提示"请将 WIFI 连接到对应设备"）
+		const hasConnectable = computed(() : boolean => {
+			const list = presetDevices.value
+			for (let i = 0; i < list.length; i++) {
+				if (list[i].connectivity) return true
+			}
+			return false
+		})
+
+	// 实时数据
+	const fix = ref<RtkFix | null>(null)
+
+	const dataRows = computed(() => {
+		const f = fix.value
+		const rows : DataRow[] = []
+		rows.push({ title: '纬度', value: f != null && f.latitude != null ? f.latitude!.toFixed(8) : '--' })
+		rows.push({ title: '经度', value: f != null && f.longitude != null ? f.longitude!.toFixed(8) : '--' })
+		rows.push({ title: '海拔(m)', value: f != null && f.altitude != null ? f.altitude!.toFixed(3) : '--' })
+		rows.push({ title: '定位状态', value: f != null ? f!.fixQuality : '--' })
+		rows.push({ title: '解算卫星数', value: f != null && f.satellitesUsed != null ? f.satellitesUsed!.toString() : '--' })
+		rows.push({ title: 'HDOP', value: f != null && f.hdop != null ? f.hdop!.toFixed(2) : '--' })
+		rows.push({ title: '卫星时间', value: f != null && f.time != null ? f.time! : '--' })
+		return rows
+	})
 
 	function goBack() : void {
 		uni.navigateBack()
 	}
 
-	function onBackgroundPermission() : void {
-		requestBackgroundPermission()
-		// 用户在设置页改完回来再刷新
-		setTimeout(() => {
-			refreshState()
-		}, 1500)
+	/* ---------------- 定位源切换 ---------------- */
+
+	function loadSource() : void {
+		const saved = uni.getStorageSync('LocationMode')
+		if (saved != null) {
+			const s = saved.toString()
+			if (s == 'amap' || s == 'rtk') {
+				locSource.value = s
+			}
+		}
+		// 恢复上次的连接方式（蓝牙 / WiFi），避免返回再进入时又切回默认蓝牙
+		const m = uni.getStorageSync('rtkConnMode')
+		if (m != null) {
+			const ms = m.toString()
+			if (ms == 'bluetooth' || ms == 'wifi') {
+				mode.value = ms
+			}
+		}
 	}
 
-	function onBattery() : void {
-		requestIgnoreBatteryOptimizations()
-		setTimeout(() => {
-			refreshState()
-		}, 1500)
+	/**
+	 * 从 storage 里上次记住的设备（rtkDevice）恢复一个可读的标签。
+	 * 返回空串表示没有可用记录。
+	 */
+	function readSavedLabel() : string {
+		const saved = uni.getStorageSync('rtkDevice')
+		if (saved == null) return ''
+		const s = saved.toString()
+		if (s == '') return ''
+		try {
+			const parsed = JSON.parse(s)
+			if (parsed instanceof UTSJSONObject) {
+				const obj = parsed as UTSJSONObject
+				const type = obj.getString("type") ?? ""
+				const name = obj.getString("name") ?? ""
+				const address = obj.getString("address") ?? ""
+				const port = obj.getString("port") ?? ""
+				if (type == "bluetooth") {
+					if (name != "" && address != "") return name + " (" + address + ")"
+					if (address != "") return address
+				} else {
+					if (name != "" && address != "") return name + " (" + address + ":" + port + ")"
+					if (address != "" && port != "") return address + ":" + port
+					if (address != "") return address
+				}
+			}
+		} catch (e) {
+		}
+		return ''
 	}
+
+	/** 最近一次 GGA 数据是否在 10 秒内（说明读线程仍在推送，连接其实还活着）。
+	 *  阈值放宽到 10 秒：部分 RTK 是慢推流（5 秒/条甚至更久），3 秒会误判为"已断"。 */
+	function lastFixIsFresh() : boolean {
+		const at = getLastFixAt()
+		if (at <= 0) return false
+		return Date.now() - at <= 10000
+	}
+
+	function syncConnectedState() : void {
+		const bt = isBluetoothConnected()
+		const tcp = isTcpConnected()
+		// 用模块级缓存的最近一次定位立即填充，避免再次进入时数据空白
+		const last = getLastFix()
+		if (last != null && last.latitude != null && last.longitude != null) {
+			fix.value = last
+		}
+		if (bt) {
+			// 蓝牙实际已连接 → 强制按蓝牙显示（纠正 mode）
+			mode.value = 'bluetooth'
+			connected.value = true
+			const lbl = readSavedLabel()
+			connectedLabel.value = lbl == '' ? '蓝牙设备' : lbl
+		} else if (tcp) {
+			// TCP 实际已连接 → 强制按 WiFi 显示（纠正 mode）
+			mode.value = 'wifi'
+			connected.value = true
+			const lbl = readSavedLabel()
+			connectedLabel.value = lbl == '' ? 'WiFi TCP 设备' : lbl
+		} else if (last != null && last.latitude != null && last.longitude != null && lastFixIsFresh()) {
+			// socket 查询不到连接、但最近还在持续收到 GGA 数据：
+			// 说明连接其实还活着（读线程仍在推送），按上次记住的方式显示已连接，
+			// 避免「返回后明明连着一进来却显示未连接」。
+			const savedMode = uni.getStorageSync('rtkConnMode')
+			if (savedMode != null && savedMode.toString() == 'bluetooth') {
+				mode.value = 'bluetooth'
+			} else {
+				mode.value = 'wifi'
+			}
+			connected.value = true
+			const lbl = readSavedLabel()
+			connectedLabel.value = lbl == '' ? 'RTK 设备' : lbl
+		} else {
+			connected.value = false
+		}
+	}
+
+	/* ---------------- 数据失活检测 ---------------- */
+
+	let staleTimer : number | null = null
+
+	function stopStaleWatch() : void {
+		// staleTimer 被 setInterval 闭包捕获修改，不能直接 smart cast，
+		// 先落到不可变局部常量再判空（同 bridge/rtk.uts stopAutoReconnect 的写法）
+		const t = staleTimer
+		if (t != null) {
+			clearInterval(t)
+			staleTimer = null
+		}
+	}
+
+	/**
+	 * 检测「数据流是否卡住」：连接中但超过阈值没收到新 GGA，说明读线程已死或设备停止输出。
+	 * socket.isConnected() 在 TCP 半关闭/对端掉线未发 FIN 时仍会误报 true，
+	 * 所以不能只靠它，必须用「最近数据时间戳」判断数据是否真的在流。
+	 */
+	function checkStale() : void {
+		if (!connected.value) return
+		const at = getLastFixAt()
+		// 从未收到数据（at==0）不判失活，可能刚连接还没锁定卫星；只判「曾经有数据、现在停了」
+		if (at <= 0) return
+		if (Date.now() - at > 15000) {
+			// 数据流停超过 15 秒：判定失活。主动断开本地 socket（避免假连接占用），
+			// 并刷新状态，让用户看到「未连接」，可手动重连。
+			console.warn("[rtk-setting] 数据流失活，最后一次 GGA 距今 " + (Date.now() - at).toString() + " ms，主动断开")
+			closeBluetoothConnection()
+			disconnectTcp()
+			connected.value = false
+			fix.value = null
+			stopStaleWatch()
+			uni.showToast({ title: '连接已中断，请重新连接', position: 'bottom' })
+		}
+	}
+
+	function startStaleWatch() : void {
+		stopStaleWatch()
+		staleTimer = setInterval(() => {
+			checkStale()
+		}, 3000)
+	}
+
+	function switchSource(s : string) : void {
+		if (locSource.value == s) return
+		locSource.value = s
+		uni.setStorageSync('LocationMode', s)
+		// 切到手机定位：断开 RTK 连接，避免后台还占着 RTK 流
+		if (s == 'amap') {
+			closeBluetoothConnection()
+			disconnectTcp()
+			connected.value = false
+			fix.value = null
+			// 清掉记住的设备，阻止自动回连把 RTK 再连回来（用户选了手机定位就只走高德）
+			uni.removeStorageSync('rtkDevice')
+		}
+		// 切到 RTK：恢复连接状态显示，并重新注册数据监听
+		if (s == 'rtk') {
+			syncConnectedState()
+		}
+	}
+
+	/* ---------------- WiFi ---------------- */
+
+	/** 两个 IPv4 是否同一 /24 网段（手机连上 RTK 热点后，前三段相同） */
+	function sameSubnet(a : string, b : string) : boolean {
+		if (a == "" || b == "" || a == "0.0.0.0" || b == "0.0.0.0") return false
+		const pa = a.split(".")
+		const pb = b.split(".")
+		if (pa.length != 4 || pb.length != 4) return false
+		return pa[0] == pb[0] && pa[1] == pb[1] && pa[2] == pb[2]
+	}
+
+	/** 把可连接的设备冒泡排到前面（列表很小，直接交换，不依赖 sort 比较器） */
+	function sortConnectableFirst(list : PresetDevice[]) : void {
+		const n = list.length
+		for (let i = 0; i < n - 1; i++) {
+			for (let j = 0; j < n - 1 - i; j++) {
+				if (!list[j].connectivity && list[j + 1].connectivity) {
+					const tmp = list[j]
+					list[j] = list[j + 1]
+					list[j + 1] = tmp
+				}
+			}
+		}
+	}
+
+	/** 对同网段设备做端口探测，标记「可连接」并排到前面（对齐旧壳 wifi-list 的行为） */
+	function probePresets(phoneIp : string) : void {
+		const list = presetDevices.value
+		let pending : number = 0
+		let finished : number = 0
+		let hit : PresetDevice | null = null
+		for (let i = 0; i < list.length; i++) {
+			const item = list[i]
+			if (!sameSubnet(phoneIp, item.address)) {
+				item.connectivity = false
+				continue
+			}
+			if (hit == null) hit = item
+			const p = parseInt(item.port, 10)
+			if (isNaN(p) || p <= 0) {
+				item.connectivity = false
+				continue
+			}
+			pending++
+			scanTcpPort(item.address, p, (open : boolean) => {
+				// 回调一到立刻点亮徽标，不等其他设备
+				item.connectivity = open
+				finished++
+				// 全部探测完立即排序，不再固定等 1.5 秒
+				if (finished >= pending) {
+					sortConnectableFirst(list)
+				}
+			})
+		}
+		matchedPreset.value = hit
+	}
+
+	function refreshWifi() : void {
+		getWifiDetails((info : RtkWifiInfo) => {
+			wifiInfo.value = info
+			probePresets(info.address)
+		})
+	}
+
+	/** 记住上次连接成功的设备，供自动回连/下次进入使用（存 JSON 字符串，读回时 JSON.parse） */
+	function rememberDevice(type : string, name : string, address : string, port : string) : void {
+		const dev : UTSJSONObject = {
+			"type": type,
+			"name": name,
+			"address": address,
+			"port": port
+		}
+		uni.setStorageSync('rtkDevice', JSON.stringify(dev))
+	}
+
+	/* ---------------- 网段自动扫描 ---------------- */
+
+	/** 自动扫描当前网段的常见 RTK 端口，发现的设备直接可点连接 */
+	function onScanSubnet() : void {
+		const subnet = currentSubnet()
+		if (subnet == "") {
+			uni.showToast({ title: '未获取到 WiFi 网段，请先连上 RTK 热点', position: 'bottom' })
+			return
+		}
+		scanningSubnet.value = true
+		scannedHosts.value = []
+		scanSubnetForRtk(subnet,
+			(ip : string, port : number) => {
+				// 命中：去重后加入列表
+				const list = scannedHosts.value
+				for (let i = 0; i < list.length; i++) {
+					if (list[i].ip == ip && list[i].port == port) return
+				}
+				const h : RtkScannedHost = { ip: ip, port: port }
+				scannedHosts.value.push(h)
+			},
+			() => {
+				scanningSubnet.value = false
+				if (scannedHosts.value.length == 0) {
+					uni.showToast({ title: '未发现开放设备，请确认已连上 RTK 热点', position: 'bottom' })
+				}
+			})
+	}
+
+	/** 连接扫描到的设备 */
+	function onConnectScanned(host : RtkScannedHost) : void {
+		uni.showLoading({ title: '连接中…' })
+		connectTcp(host.ip, host.port, (res : RtkResult) => {
+			uni.hideLoading()
+			if (res.code == 0) {
+				connected.value = true
+				connectedLabel.value = host.ip + ":" + host.port.toString()
+				rememberDevice('wifi', '', host.ip, host.port.toString())
+				uni.showToast({ title: '连接成功', position: 'bottom' })
+			} else {
+				uni.showToast({ title: res.msg, position: 'bottom' })
+			}
+		})
+	}
+
+	/* ---------------- 蓝牙 ---------------- */
+
+	function onScanBluetooth() : void {
+		scanning.value = true
+		requestBluetoothPermission().then((ok : boolean) => {
+			if (!ok) {
+				scanning.value = false
+				uni.showToast({ title: '未授予蓝牙权限', position: 'bottom' })
+				return
+			}
+			stopBluetoothDiscovery()
+			startBluetoothDiscovery((devices : RtkBluetoothDevice[]) => {
+				bluetoothDevices.value = devices
+				if (devices.length > 0) scanning.value = false
+			})
+			// 兜底：12 秒后还没结果就停掉转圈
+			setTimeout(() => {
+				scanning.value = false
+			}, 12000)
+		})
+	}
+
+	/* ---------------- 模式切换 ---------------- */
+
+	function switchMode(m : string) : void {
+		if (mode.value == m) return
+		// 已连接时禁止直接切换连接方式：必须先点「断开连接」，避免 WiFi 连着一键切蓝牙把连接断掉
+		if (connected.value) {
+			uni.showToast({ title: '请先断开连接，再切换连接方式', position: 'bottom' })
+			return
+		}
+		mode.value = m
+		uni.setStorageSync('rtkConnMode', m)
+		if (m == 'bluetooth') {
+			onScanBluetooth()
+		} else {
+			stopBluetoothDiscovery()
+			refreshWifi()
+		}
+	}
+
+	function onConnectBluetooth(device : RtkBluetoothDevice) : void {
+		uni.showLoading({ title: '连接中…' })
+		connectBluetooth(device.address, (res : RtkResult) => {
+			uni.hideLoading()
+			if (res.code == 0) {
+				stopBluetoothDiscovery()
+				connected.value = true
+				connectedLabel.value = device.name + " (" + device.address + ")"
+				rememberDevice('bluetooth', device.name, device.address, '')
+				uni.showToast({ title: '连接成功', position: 'bottom' })
+			} else {
+				uni.showToast({ title: res.msg, position: 'bottom' })
+			}
+		})
+	}
+
+	/* ---------------- WiFi / TCP ---------------- */
+
+	function onProbe() : void {
+		const p = parseInt(port.value, 10)
+		if (ip.value == '' || isNaN(p)) {
+			uni.showToast({ title: '请输入 IP 和端口', position: 'bottom' })
+			return
+		}
+		probeText.value = '探测中…'
+		scanTcpPort(ip.value, p, (isOpen : boolean) => {
+			probeText.value = isOpen ? '端口开放，可连接' : '端口未开放，请检查网络'
+		})
+	}
+
+	function onConnectTcp() : void {
+		const p = parseInt(port.value, 10)
+		if (ip.value == '' || isNaN(p)) {
+			uni.showToast({ title: '请输入 IP 和端口', position: 'bottom' })
+			return
+		}
+		uni.showLoading({ title: '连接中…' })
+		connectTcp(ip.value, p, (res : RtkResult) => {
+			uni.hideLoading()
+			if (res.code == 0) {
+				connected.value = true
+				connectedLabel.value = ip.value + ":" + port.value
+				rememberDevice('wifi', '', ip.value, port.value)
+				uni.showToast({ title: '连接成功', position: 'bottom' })
+			} else {
+				uni.showToast({ title: res.msg, position: 'bottom' })
+			}
+		})
+	}
+
+	/* ---------------- 固定清单点选连接 ---------------- */
+
+	function onConnectPreset(device : PresetDevice) : void {
+		// 不可连接的设备（端口探测未通过）禁止点击连接
+		if (!device.connectivity) {
+			uni.showToast({ title: '该设备当前不可连接', position: 'bottom' })
+			return
+		}
+		const p = parseInt(device.port, 10)
+		uni.showLoading({ title: '连接中…' })
+		connectTcp(device.address, p, (res : RtkResult) => {
+			uni.hideLoading()
+			if (res.code == 0) {
+				connected.value = true
+				connectedLabel.value = device.name + " (" + device.address + ":" + device.port + ")"
+				rememberDevice('wifi', device.name, device.address, device.port)
+				uni.showToast({ title: '连接成功', position: 'bottom' })
+			} else {
+				uni.showToast({ title: res.msg, position: 'bottom' })
+			}
+		})
+	}
+
+	/* ---------------- 断开 ---------------- */
+
+	function onDisconnect() : void {
+		// 两条通道都断掉：先连蓝牙再切 WiFi 时，只断当前模式会留下另一条连接
+		closeBluetoothConnection()
+		disconnectTcp()
+		connected.value = false
+		fix.value = null
+		// 清除记住的设备：自动回连（App 每 10 秒轮询）会按 rtkDevice 重连，
+		// 用户主动断开后必须清掉，否则 10 秒内又会被自动连上
+		uni.removeStorageSync('rtkDevice')
+		uni.showToast({ title: '已断开', position: 'bottom' })
+	}
+
+	/* ---------------- 数据监听 ---------------- */
+
+	function onNmea(data : string) : void {
+		const f = parseGga(data)
+		if (f != null && f.latitude != null && f.longitude != null) {
+			fix.value = f
+			// 收到有效 GGA 就说明 RTK 连接是活的——数据是最可靠的连接凭证，
+			// 比 socket.isConnected() 更真实（后者在 TCP 半关闭/蓝牙状态机抖动时会误判）。
+			// 这里直接驱动 connected，解决「返回再进入时像没连接、过几秒才恢复」。
+			if (!connected.value) {
+				connected.value = true
+				// 连接方式未知时按 socket 状态纠正；否则沿用当前 mode
+				if (isTcpConnected()) {
+					mode.value = 'wifi'
+				} else if (isBluetoothConnected()) {
+					mode.value = 'bluetooth'
+				}
+				if (connectedLabel.value == '') {
+					const lbl = readSavedLabel()
+					connectedLabel.value = lbl == '' ? 'RTK 设备' : lbl
+				}
+			}
+		}
+	}
+
+	// UTS 里函数名不能直接当值传递（会被当成调用），用 lambda 包一层；
+	// 用同一个实例注册/注销，才能保证注销得掉
+	const nmeaListener : (data : string) => void = (data : string) => {
+		onNmea(data)
+	}
+
+	/** 模板里不能直接绑导入的函数名，包一层本地函数 */
+	function onOpenWifiSettings() : void {
+		openWifiSettings()
+	}
+
+	onMounted(() => {
+		loadSource()
+		registerDataListener(nmeaListener)
+		if (locSource.value == 'rtk') {
+			syncConnectedState()
+			if (mode.value == 'wifi') refreshWifi()
+		}
+	})
 
 	onShow(() => {
-		refreshState()
+		loadSource()
+		// 回到页面时同步连接状态；数据监听在 onMounted 已注册（模块级持久），
+		// 这里再兜底注册一次（幂等），确保返回后定位信息持续更新
+		registerDataListener(nmeaListener)
+		if (locSource.value == 'rtk') {
+			syncConnectedState()
+			if (mode.value == 'wifi') refreshWifi()
+		}
+		// 启动数据失活检测（页面可见时持续监测，连接中数据停了会提示重连）
+		startStaleWatch()
+	})
+
+	onUnload(() => {
+		// 不断开 RTK 连接（socket 是模块级全局的，断开会影响网页侧持续定位）。
+		// 仅注销本页面的数据监听（避免页面销毁后闭包引用已销毁的 ref），
+		// 定位数据由 tdyb-rtk 模块级 lastFix 持续缓存，重新进入时用 getLastFix() 恢复。
+		unregisterDataListener(nmeaListener)
+		stopBluetoothDiscovery()
+		stopStaleWatch()
 	})
 </script>
 
@@ -152,6 +850,13 @@
 		margin-bottom: 12px;
 	}
 
+	.card-head {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 8px;
+	}
+
 	.card-title {
 		font-size: 15px;
 		font-weight: bold;
@@ -168,11 +873,39 @@
 	.row-tip {
 		font-size: 12px;
 		color: #9ca3af;
+		margin-bottom: 8px;
 	}
 
+	/* tab */
+	.tabs {
+		flex-direction: row;
+		background-color: #f3f4f6;
+		border-radius: 8px;
+		padding: 3px;
+	}
+
+	.tab {
+		flex: 1;
+		height: 34px;
+		align-items: center;
+		justify-content: center;
+		border-radius: 6px;
+	}
+
+	.tab-active {
+		background-color: #ffffff;
+	}
+
+	.tab-text {
+		font-size: 14px;
+		color: #4b5563;
+	}
+
+	/* 按钮 */
 	.btn {
-		margin-top: 8px;
-		height: 38px;
+		flex: 1;
+		margin-top: 10px;
+		height: 40px;
 		border-radius: 8px;
 		background-color: #1677ff;
 		align-items: center;
@@ -182,5 +915,139 @@
 	.btn-text {
 		font-size: 14px;
 		color: #ffffff;
+	}
+
+	.btn-row {
+		flex-direction: row;
+		margin-top: 10px;
+	}
+
+	.btn-sm {
+		height: 30px;
+		padding-left: 12px;
+		padding-right: 12px;
+		border-radius: 6px;
+		background-color: #1677ff;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.btn-sm-text {
+		font-size: 13px;
+		color: #ffffff;
+	}
+
+	.btn-danger {
+		background-color: #f5222d;
+	}
+
+	/* 设备列表 */
+	.empty {
+		padding: 20px 0;
+		align-items: center;
+	}
+
+	.empty-text {
+		font-size: 13px;
+		color: #9ca3af;
+	}
+
+	.device {
+		flex-direction: row;
+		align-items: center;
+		padding-top: 12px;
+		padding-bottom: 12px;
+		border-bottom-width: 1px;
+		border-bottom-style: solid;
+		border-bottom-color: #f3f4f6;
+	}
+
+	.device-main {
+		flex: 1;
+	}
+
+	.device-name {
+		font-size: 14px;
+		color: #111827;
+	}
+
+	.device-addr {
+		font-size: 12px;
+		color: #9ca3af;
+		margin-top: 2px;
+	}
+
+	.device-badge {
+		font-size: 12px;
+		color: #1677ff;
+		margin-right: 8px;
+	}
+
+	.device-badge-ok {
+		font-size: 12px;
+		color: #16a34a;
+		margin-right: 8px;
+	}
+
+	.device-badge-disabled {
+		font-size: 12px;
+		color: #9ca3af;
+		margin-right: 8px;
+	}
+
+	.device-connect {
+		font-size: 13px;
+		color: #1677ff;
+	}
+
+	.device-connect-disabled {
+		color: #c0c4cc;
+	}
+
+	/* 输入框 */
+	.field {
+		flex-direction: row;
+		align-items: center;
+		margin-top: 10px;
+	}
+
+	.field-label {
+		width: 64px;
+		font-size: 13px;
+		color: #4b5563;
+	}
+
+	.field-input {
+		flex: 1;
+		height: 38px;
+		border-radius: 6px;
+		background-color: #f3f4f6;
+		padding-left: 10px;
+		padding-right: 10px;
+		font-size: 14px;
+		color: #111827;
+	}
+
+	/* 实时数据 */
+	.data-row {
+		flex-direction: row;
+		align-items: center;
+		padding-top: 10px;
+		padding-bottom: 10px;
+		border-bottom-width: 1px;
+		border-bottom-style: solid;
+		border-bottom-color: #f3f4f6;
+	}
+
+	.data-title {
+		width: 100px;
+		font-size: 13px;
+		color: #6b7280;
+	}
+
+	.data-value {
+		flex: 1;
+		font-size: 14px;
+		color: #111827;
 	}
 </style>

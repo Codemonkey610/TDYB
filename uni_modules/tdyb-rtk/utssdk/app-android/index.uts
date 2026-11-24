@@ -1,0 +1,936 @@
+/**
+ * RKT 定位 UTS 插件（uni-app x / App-Android）
+ *
+ *   1) 经典蓝牙 SPP（RFCOMM）扫描 / 配对 / 连接 / 读 NMEA 流
+ *   2) WiFi TCP 连接 / 端口扫描 / 读 NMEA 流
+ *   3) NMEA GGA 解析 + 度分 → WGS84 十进制度
+ *
+ * 数据回传：收到一行 NMEA 文本就 post 到主线程，回调给所有 dataListener。
+ *           唤醒方（rtk-setting 页面 / bridge 层）自己判断是不是 GGA 再解析。
+ */
+
+import BluetoothAdapter from 'android.bluetooth.BluetoothAdapter'
+import BluetoothDevice from 'android.bluetooth.BluetoothDevice'
+import BluetoothSocket from 'android.bluetooth.BluetoothSocket'
+import BroadcastReceiver from 'android.content.BroadcastReceiver'
+import Context from 'android.content.Context'
+import Intent from 'android.content.Intent'
+import IntentFilter from 'android.content.IntentFilter'
+import UUID from 'java.util.UUID'
+import Thread from 'java.lang.Thread'
+import Runnable from 'java.lang.Runnable'
+import Build from 'android.os.Build'
+import Handler from 'android.os.Handler'
+import Looper from 'android.os.Looper'
+
+import Socket from 'java.net.Socket'
+import InetSocketAddress from 'java.net.InetSocketAddress'
+import InputStream from 'java.io.InputStream'
+import InputStreamReader from 'java.io.InputStreamReader'
+import BufferedReader from 'java.io.BufferedReader'
+
+import WifiManager from 'android.net.wifi.WifiManager'
+import Settings from 'android.provider.Settings'
+import ConnectivityManager from 'android.net.ConnectivityManager'
+import Network from 'android.net.Network'
+import NetworkCapabilities from 'android.net.NetworkCapabilities'
+import NetworkRequest from 'android.net.NetworkRequest'
+import NetworkCallback from 'android.net.ConnectivityManager.NetworkCallback'
+
+/* ------------------------------ 对外类型 ------------------------------ */
+
+export type RtkBluetoothDevice = {
+	name : string
+	address : string
+	bondState : number
+	type : number
+}
+
+export type RtkWifiInfo = {
+	address : string
+	ssid : string
+	bssid : string
+	speed : string
+	rssi : string
+}
+
+export type RtkResult = {
+	code : number   // 0 成功；-1 失败
+	msg : string
+	data : string   // NMEA 原始文本等
+}
+
+/** 网段扫描发现的开放主机（IP + 开放的 RTK 端口） */
+export type RtkScannedHost = {
+	ip : string
+	port : number
+}
+
+/** GGA 解析后的定位结果（字段可能为 null） */
+export type RtkFix = {
+	latitude : number | null
+	longitude : number | null
+	altitude : number | null
+	fixQuality : string        // 中文描述，如「RTK固定解」
+	fixQualityCode : number | null
+	fixStatus : string         // 英文，fixed / float / single / 等，供前端 isFixedSolution 判断
+	satellitesUsed : number | null
+	hdop : number | null
+	time : string | null
+	raw : string               // 原始 GGA 行
+}
+
+/* ------------------------------ 常量 ------------------------------ */
+
+const SPP_UUID : string = "00001101-0000-1000-8000-00805F9B34FB"
+const FLAG_RECEIVER_EXPORTED : Int = 2
+// 蓝牙配对状态（对应 BluetoothDevice.BOND_NONE / BOND_BONDED）
+const BOND_NONE : number = 10.0
+const BOND_BONDED : number = 12.0
+
+/* ------------------------------ 模块状态 ------------------------------ */
+
+// 蓝牙
+let bluetoothAdapter : BluetoothAdapter | null = null
+let discoveryReceiver : BluetoothDiscoveryReceiver | null = null
+let discoveryCallback : ((devices : RtkBluetoothDevice[]) => void) | null = null
+let discoveredDevices : RtkBluetoothDevice[] = []
+let bluetoothSocket : BluetoothSocket | null = null
+
+// TCP
+let tcpSocket : Socket | null = null
+
+// WiFi 网络绑定（对齐旧插件 Lin-RtkManager 的 WifiConnectManager）：
+// RTK 热点一般没有互联网，Android 会把它标记为「无网」并把默认网络切到蜂窝。
+// 用「默认网络」建立的 TCP，在系统做网络切换/重评估后流量会被黑洞（对端收不到、
+// 也不回 RST），表现为读线程永久阻塞、isConnected() 误报、数据卡住但显示已连接。
+// 旧插件靠 requestNetwork 拿到 WiFi 的 Network、再用它的 SocketFactory 建连，
+// 强制流量走 WiFi 接口，这是它能长时间稳定连接的关键，这里对齐。
+let wifiNetwork : Network | null = null
+let wifiNetworkRequested : boolean = false
+
+// 数据监听
+let dataListeners : Array<(data : string) => void> = []
+
+// 最近一次 GGA 解析结果
+let lastFix : RtkFix | null = null
+let lastFixAt : number = 0
+
+/* ------------------------------ 工具 ------------------------------ */
+
+function appContext() : Context {
+	return UTSAndroid.getAppContext()!
+}
+
+class UiRunnable implements Runnable {
+	private fn : () => void
+	constructor(fn : () => void) {
+		this.fn = fn
+	}
+	override run() : void {
+		this.fn()
+	}
+}
+
+// 主线程 Handler：用 Looper.getMainLooper() 创建，不依赖 Activity 生命周期。
+// 长时间运行/App 前后台切换后，getUniActivity() 可能返回已失效的 Activity，
+// 导致 runOnUiThread 投递到失效队列 → 数据不再分发（表现为「数据卡住」）。
+// 这里用全局主线程 Handler 替代，保证数据分发永远走主线程消息队列。
+let mainHandler : Handler | null = null
+function getMainHandler() : Handler {
+	if (mainHandler == null) {
+		mainHandler = new Handler(Looper.getMainLooper())
+	}
+	return mainHandler!
+}
+
+/** 把一段逻辑抛回主线程执行（读流线程收到数据后必须走这里再回调/更新 UI） */
+function postToUi(fn : () => void) : void {
+	getMainHandler().post(new UiRunnable(fn))
+}
+
+/* ------------------------------ WiFi 网络绑定 ------------------------------ */
+
+/** WiFi 网络回调：持有 RTK 热点对应的 Network 对象 */
+class WifiNetworkCallback extends NetworkCallback {
+	constructor() {
+		super()
+	}
+	override onAvailable(network : Network) : void {
+		wifiNetwork = network
+		console.log("[tdyb-rtk] 已绑定 WiFi 网络")
+	}
+	override onLost(network : Network) : void {
+		if (wifiNetwork == network) {
+			wifiNetwork = null
+			console.warn("[tdyb-rtk] WiFi 网络已丢失")
+		}
+	}
+}
+
+/** 请求绑定 WiFi 网络（幂等，只需调一次；成功后 onAvailable 异步回填 wifiNetwork） */
+function ensureWifiNetworkBound() : void {
+	if (wifiNetworkRequested) return
+	wifiNetworkRequested = true
+	try {
+		const cm = appContext().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+		const req = new NetworkRequest.Builder()
+			.addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+			.build()
+		cm.requestNetwork(req, new WifiNetworkCallback())
+	} catch (e) {
+		console.warn("[tdyb-rtk] 绑定 WiFi 网络失败，退回默认网络")
+	}
+}
+
+/**
+ * 创建走 WiFi 接口的 socket：
+ * 已拿到 WiFi Network 时用它的 SocketFactory（强制走 RTK 热点，不怕系统切蜂窝），
+ * 否则退回普通 socket（默认网络）。扫描和正式连接都必须走这里。
+ */
+function createLanSocket() : Socket {
+	const n = wifiNetwork
+	if (n != null) {
+		try {
+			return n.getSocketFactory().createSocket()
+		} catch (e) {
+		}
+	}
+	return new Socket()
+}
+
+function toIntSafe(s : string) : number | null {
+	const t = s.trim()
+	if (t == "") return null
+	const v = parseInt(t, 10)
+	if (isNaN(v)) return null
+	return v
+}
+
+function toFloatSafe(s : string) : number | null {
+	const t = s.trim()
+	if (t == "") return null
+	const v = parseFloat(t)
+	if (isNaN(v)) return null
+	return v
+}
+
+/* ------------------------------ 数据分发 ------------------------------ */
+
+function onRawData(line : string) : void {
+	// 更新最近一次 GGA 解析结果（不是 GGA 就跳过）
+	const fix = parseGga(line)
+	if (fix != null) {
+		lastFix = fix
+		lastFixAt = Date.now()
+	}
+
+	for (let i = 0; i < dataListeners.length; i++) {
+		dataListeners[i](line)
+	}
+}
+
+/** 注册 NMEA 数据监听（每次收到一行文本回调一次） */
+export function registerDataListener(listener : (data : string) => void) : void {
+	if (listener == null) return
+	for (let i = 0; i < dataListeners.length; i++) {
+		if (dataListeners[i] === listener) return
+	}
+	dataListeners.push(listener)
+}
+
+export function unregisterDataListener(listener : (data : string) => void) : void {
+	for (let i = dataListeners.length - 1; i >= 0; i--) {
+		if (dataListeners[i] === listener) {
+			dataListeners.splice(i, 1)
+		}
+	}
+}
+
+export function getLastFix() : RtkFix | null {
+	return lastFix
+}
+
+/** 最近一次有效 GGA 的时间戳（ms），从未收到过返回 0 */
+export function getLastFixAt() : number {
+	return lastFixAt
+}
+
+/** 是否有任一通道（蓝牙或 TCP）已连接 */
+export function isRtkConnected() : boolean {
+	return (bluetoothSocket != null && bluetoothSocket!.isConnected()) ||
+		(tcpSocket != null && tcpSocket!.isConnected())
+}
+
+/* ------------------------------ NMEA 读取线程 ------------------------------ */
+
+class NmeaReaderRunnable implements Runnable {
+	private input : InputStream
+	private label : string
+	private onExit : (() => void) | null
+
+	constructor(input : InputStream, label : string, onExit : (() => void) | null) {
+		this.input = input
+		this.label = label
+		this.onExit = onExit
+	}
+
+	override run() : void {
+		let reader : BufferedReader | null = null
+		try {
+			reader = new BufferedReader(new InputStreamReader(this.input))
+			while (true) {
+				const line = reader.readLine()
+				if (line == null) break
+				const ln = line.trim()
+				if (ln.length == 0) continue
+				// 回主线程分发，避免回调跑到后台线程
+				postToUi(() => {
+					onRawData(ln)
+				})
+			}
+		} catch (e) {
+			// 连接关闭或读取失败，走 finally 收尾
+			console.warn("[tdyb-rtk] " + this.label + " 读取异常，连接已断开")
+		} finally {
+			try {
+				if (reader != null) reader.close()
+			} catch (e) {
+			}
+			// 对齐旧插件（蓝牙线程异常就地 closeBluetoothConnection）：
+			// 读线程退出 = 连接已死，主动关掉本地 socket，
+			// 让 isConnected() 立刻反映真实状态，重连逻辑才能接管。
+			const cb = this.onExit
+			if (cb != null) {
+				postToUi(() => {
+					cb()
+				})
+			}
+			console.log("[tdyb-rtk] " + this.label + " 读取线程退出")
+		}
+	}
+}
+
+/* ------------------------------ 蓝牙：扫描 ------------------------------ */
+
+class BluetoothDiscoveryReceiver extends BroadcastReceiver {
+	// 继承 Android 类必须显式构造函数里调 super()，
+	// 否则生成的 Kotlin 是 `class X : BroadcastReceiver`（少了括号），
+	// 报 "This type has a constructor, so it must be initialized here"
+	constructor() {
+		super()
+	}
+
+	override onReceive(context : Context, intent : Intent) : void {
+		const action = intent.getAction()
+		if (action == BluetoothDevice.ACTION_FOUND) {
+			const device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) as BluetoothDevice | null
+			if (device == null) return
+			const name = device.getName()
+			if (name == null || name == "") return
+			const d : RtkBluetoothDevice = {
+				name: name,
+				address: device.getAddress() ?? "",
+				bondState: device.getBondState().toDouble(),
+				type: device.getType().toDouble()
+			}
+			upsertDevice(d)
+			const cb = discoveryCallback
+			if (cb != null) {
+				const copy : RtkBluetoothDevice[] = []
+				for (let i = 0; i < discoveredDevices.length; i++) {
+					copy.push(discoveredDevices[i])
+				}
+				cb(copy)
+			}
+		} else if (action == BluetoothAdapter.ACTION_DISCOVERY_FINISHED) {
+			console.log("[tdyb-rtk] 蓝牙扫描结束，共 " + discoveredDevices.length.toString() + " 台")
+		}
+	}
+}
+
+function upsertDevice(d : RtkBluetoothDevice) : void {
+	for (let i = 0; i < discoveredDevices.length; i++) {
+		if (discoveredDevices[i].address == d.address) {
+			discoveredDevices[i] = d
+			return
+		}
+	}
+	discoveredDevices.push(d)
+}
+
+/** 开始蓝牙扫描，每发现一台设备回调一次完整列表 */
+export function startBluetoothDiscovery(callback : (devices : RtkBluetoothDevice[]) => void) : void {
+	discoveredDevices = []
+	discoveryCallback = callback
+
+	const ctx = appContext()
+	if (discoveryReceiver == null) {
+		discoveryReceiver = new BluetoothDiscoveryReceiver()
+		const filter = new IntentFilter(BluetoothDevice.ACTION_FOUND)
+		filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+		try {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+				ctx.registerReceiver(discoveryReceiver!, filter, FLAG_RECEIVER_EXPORTED)
+			} else {
+				ctx.registerReceiver(discoveryReceiver!, filter)
+			}
+			startDiscovery()
+		} catch (e) {
+			console.error("[tdyb-rtk] 注册蓝牙广播失败", e)
+		}
+	} else {
+		startDiscovery()
+	}
+}
+
+function startDiscovery() : void {
+	const adapter = getBluetoothAdapter()
+	if (adapter == null) return
+	// Android 12+ 没有 BLUETOOTH_SCAN 时，cancelDiscovery/isEnabled/startDiscovery 都会抛 SecurityException
+	try {
+		adapter.cancelDiscovery()
+		if (!adapter.isEnabled()) {
+			try {
+				adapter.enable()
+			} catch (e) {
+				console.warn("[tdyb-rtk] 开启蓝牙失败，请手动打开蓝牙")
+			}
+		}
+		const started = adapter.startDiscovery()
+		if (!started) {
+			console.warn("[tdyb-rtk] 启动扫描失败（蓝牙未开或没有扫描权限）")
+		}
+	} catch (e) {
+		console.warn("[tdyb-rtk] 启动扫描被拒绝，请检查 BLUETOOTH_SCAN 权限")
+	}
+}
+
+/** 停止蓝牙扫描 */
+export function stopBluetoothDiscovery() : void {
+	// 整段兜底：没授权时 isDiscovering() 本身就会抛 SecurityException
+	try {
+		const adapter = getBluetoothAdapter()
+		if (adapter == null) return
+		if (adapter.isDiscovering()) {
+			adapter.cancelDiscovery()
+		}
+	} catch (e) {
+		// 没有 BLUETOOTH_SCAN 权限，忽略即可
+	}
+}
+
+/** 重新扫描（清空列表再扫） */
+export function refreshBluetoothList() : void {
+	stopBluetoothDiscovery()
+	discoveredDevices = []
+	startDiscovery()
+}
+
+function getBluetoothAdapter() : BluetoothAdapter | null {
+	if (bluetoothAdapter == null) {
+		bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+	}
+	return bluetoothAdapter
+}
+
+/* ------------------------------ 蓝牙：连接 / 断开 ------------------------------ */
+
+/** 显式配对：已配对直接通过；未配对则发起 createBond 并轮询等待配对完成（最长 15 秒） */
+function ensureBonded(device : BluetoothDevice) : boolean {
+	try {
+		if (device.getBondState().toDouble() == BOND_BONDED) return true
+		// 未配对，显式发起配对（多数 RTK 蓝牙接收机自动接受 PIN 1234/0000）
+		device.createBond()
+		const deadline = Date.now() + 15000
+		const pollMs : number = 300
+		while (Date.now() < deadline) {
+			const s = device.getBondState().toDouble()
+			if (s == BOND_BONDED) return true
+			if (s == BOND_NONE) {
+				// 配对被取消/失败，重试一次
+				device.createBond()
+			}
+			Thread.sleep(pollMs.toLong())
+		}
+		return device.getBondState().toDouble() == BOND_BONDED
+	} catch (e) {
+		return false
+	}
+}
+
+class BluetoothConnectRunnable implements Runnable {
+	private mac : string
+	private callback : (res : RtkResult) => void
+
+	constructor(mac : string, callback : (res : RtkResult) => void) {
+		this.mac = mac
+		this.callback = callback
+	}
+
+	override run() : void {
+		if (bluetoothSocket != null && bluetoothSocket!.isConnected()) {
+			postToUi(() => this.callback({ code: 0, msg: "已连接", data: "" }))
+			return
+		}
+		try {
+			const adapter = getBluetoothAdapter()
+			if (adapter == null) {
+				postToUi(() => this.callback({ code: -1, msg: "本机不支持蓝牙", data: "" }))
+				return
+			}
+			adapter.cancelDiscovery()
+			const device = adapter.getRemoteDevice(this.mac)
+
+			// 显式自动配对：未配对先 createBond 并等待配对完成，再建 SPP 连接
+			if (!ensureBonded(device)) {
+				postToUi(() => this.callback({ code: -1, msg: "蓝牙配对失败", data: "" }))
+				return
+			}
+
+			const socket = device.createRfcommSocketToServiceRecord(UUID.fromString(SPP_UUID))
+			socket.connect()
+			bluetoothSocket = socket
+			startReaderThread(socket.getInputStream(), "蓝牙", () => {
+				closeBluetoothInternal()
+			})
+			postToUi(() => this.callback({ code: 0, msg: "连接成功", data: "" }))
+		} catch (e) {
+			closeBluetoothInternal()
+			postToUi(() => this.callback({ code: -1, msg: "蓝牙连接失败", data: "" }))
+		}
+	}
+}
+
+/** 连接蓝牙设备（mac 为设备地址） */
+export function connectBluetooth(mac : string, callback : (res : RtkResult) => void) : void {
+	const t = new Thread(new BluetoothConnectRunnable(mac, callback))
+	t.start()
+}
+
+function startReaderThread(input : InputStream, label : string, onExit : (() => void) | null) : void {
+	const reader = new NmeaReaderRunnable(input, label, onExit)
+	const t = new Thread(reader)
+	t.start()
+}
+
+function closeBluetoothInternal() : void {
+	try {
+		if (bluetoothSocket != null) bluetoothSocket!.close()
+	} catch (e) {
+	}
+	bluetoothSocket = null
+}
+
+/** 断开蓝牙连接 */
+export function closeBluetoothConnection() : void {
+	closeBluetoothInternal()
+}
+
+export function isBluetoothConnected() : boolean {
+	return bluetoothSocket != null && bluetoothSocket!.isConnected()
+}
+
+/* ------------------------------ TCP：端口扫描 ------------------------------ */
+
+class TcpPortScanRunnable implements Runnable {
+	private ip : string
+	private port : number
+	private callback : (isOpen : boolean) => void
+
+	constructor(ip : string, port : number, callback : (isOpen : boolean) => void) {
+		this.ip = ip
+		this.port = port
+		this.callback = callback
+	}
+
+	override run() : void {
+		let open = false
+		let s : Socket | null = null
+		try {
+			// 走绑定的 WiFi 网络探测，避免系统把探测包路由到蜂窝
+			// 超时 600ms：局域网 RTT 是毫秒级，2 秒纯属拖慢「可连接」显示
+			s = createLanSocket()
+			s.connect(new InetSocketAddress(this.ip, this.port.toInt()), 600)
+			open = true
+		} catch (e) {
+			open = false
+		} finally {
+			try {
+				if (s != null) s.close()
+			} catch (e) {
+			}
+		}
+		postToUi(() => this.callback(open))
+	}
+}
+
+/** 探测单个 TCP 端口是否开放（600ms 超时，局域网探测足够） */
+export function scanTcpPort(ip : string, port : number, callback : (isOpen : boolean) => void) : void {
+	ensureWifiNetworkBound()
+	const t = new Thread(new TcpPortScanRunnable(ip, port, callback))
+	t.start()
+}
+
+/* ------------------------------ 网段扫描（自动发现 RTK） ------------------------------ */
+
+/**
+ * 常见 RTK 设备默认端口（NMEA over TCP）。
+ * 覆盖千寻(15160/9000)、华测(1212)、中海达(4545)、南方(2010) 及通用 8000/8080 等。
+ */
+const RTK_COMMON_PORTS : number[] = [9000, 15160, 1212, 4545, 2010, 8000, 8001, 8080]
+
+/** 网段扫描里单个 IP 的探测线程：串行探该 IP 的所有常见端口 */
+class SubnetProbeRunnable implements Runnable {
+	private ip : string
+	private ports : number[]
+	private onHit : (ip : string, port : number) => void
+	private onDone : () => void
+
+	constructor(ip : string, ports : number[], onHit : (ip : string, port : number) => void, onDone : () => void) {
+		this.ip = ip
+		this.ports = ports
+		this.onHit = onHit
+		this.onDone = onDone
+	}
+
+	override run() : void {
+		try {
+			for (let i = 0; i < this.ports.length; i++) {
+				const p = this.ports[i]
+				let s : Socket | null = null
+				try {
+					s = createLanSocket()
+					// 短超时：扫描用，不是正式连接
+					s.connect(new InetSocketAddress(this.ip, p.toInt()), 300)
+					postToUi(() => this.onHit(this.ip, p))
+				} catch (e) {
+					// 端口未开放，继续下一个
+				} finally {
+					try {
+						if (s != null) s.close()
+					} catch (e) {
+					}
+				}
+			}
+		} finally {
+			postToUi(() => this.onDone())
+		}
+	}
+}
+
+/**
+ * 扫描某个网段（如 "192.168.10"）内 1~50 号 IP 的常见 RTK 端口，
+ * 发现开放主机就回调一次 onHit，全部扫完回调 onComplete。
+ *
+ * 说明：RTK 作为 WiFi 热点时，其 IP 几乎都是网关小号（.1/.2 等），
+ * 扫 1~50 已足够覆盖，且比扫满 254 快得多。
+ */
+export function scanSubnetForRtk(subnet : string, onHit : (ip : string, port : number) => void, onComplete : () => void) : void {
+	ensureWifiNetworkBound()
+	if (subnet == "" || subnet == "0.0.0") {
+		postToUi(() => onComplete())
+		return
+	}
+
+	// 只扫 1~50，兼顾速度与覆盖率
+	const START = 1
+	const END = 50
+
+	// 用一个局部数组对象做计数器（引用类型，闭包内自增自减都安全，避免闭包捕获可变局部变量的限制）
+	const counter : number[] = [END - START + 1]
+
+	for (let host = START; host <= END; host++) {
+		const ip = subnet + "." + host.toString()
+		const t = new Thread(new SubnetProbeRunnable(ip, RTK_COMMON_PORTS, onHit, () => {
+			counter[0] = counter[0] - 1
+			if (counter[0] <= 0) {
+				onComplete()
+			}
+		}))
+		t.start()
+	}
+}
+
+/**
+ * 从手机当前 WiFi 的 IP 推导网段（前三段），返回如 "192.168.10"。
+ * 拿不到或非正常 IP 返回空串。
+ */
+export function currentSubnet() : string {
+	try {
+		const ctx = appContext()
+		const wifi = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+		const info = wifi.getConnectionInfo()
+		const ip = info.getIpAddress()
+		if (ip == 0) return ""
+		const a = (ip & 0xff)
+		const b = (ip >> 8) & 0xff
+		const c = (ip >> 16) & 0xff
+		return a.toString() + "." + b.toString() + "." + c.toString()
+	} catch (e) {
+		return ""
+	}
+}
+
+/* ------------------------------ TCP：连接 / 断开 ------------------------------ */
+
+class TcpConnectRunnable implements Runnable {
+	private ip : string
+	private port : number
+	private callback : (res : RtkResult) => void
+
+	constructor(ip : string, port : number, callback : (res : RtkResult) => void) {
+		this.ip = ip
+		this.port = port
+		this.callback = callback
+	}
+
+	override run() : void {
+		if (tcpSocket != null && tcpSocket!.isConnected()) {
+			postToUi(() => this.callback({ code: 0, msg: "已连接", data: "" }))
+			return
+		}
+		try {
+			// 优先用绑定的 WiFi 网络建连（对齐旧插件），
+			// 防止 RTK 热点「无互联网」被系统切到蜂窝后，连接流量被黑洞
+			const s = createLanSocket()
+			s.connect(new InetSocketAddress(this.ip, this.port.toInt()), 10000)
+			// 长连接加固：
+			//  - keepalive：对端静默掉线（设备断电/热点休眠）时，让协议栈有机会探测到死连接
+			//  - nodelay：关闭 Nagle，NMEA 小行数据立即发出，降低延迟
+			// 注意：真正的「假连接」兜底靠 bridge 层的数据新鲜度看门狗（getLastFixAt），
+			// 因为 isConnected() 只反映本地有没有 close()，对端掉了它也照样返回 true。
+			s.setKeepAlive(true)
+			s.setTcpNoDelay(true)
+			tcpSocket = s
+			startReaderThread(s.getInputStream(), "TCP", () => {
+				closeTcpInternal()
+			})
+			postToUi(() => this.callback({ code: 0, msg: "连接成功", data: "" }))
+		} catch (e) {
+			closeTcpInternal()
+			postToUi(() => this.callback({ code: -1, msg: "TCP 连接失败", data: "" }))
+		}
+	}
+}
+
+/** 通过 WiFi TCP 连接 RTK */
+export function connectTcp(ip : string, port : number, callback : (res : RtkResult) => void) : void {
+	ensureWifiNetworkBound()
+	const t = new Thread(new TcpConnectRunnable(ip, port, callback))
+	t.start()
+}
+
+function closeTcpInternal() : void {
+	try {
+		if (tcpSocket != null) tcpSocket!.close()
+	} catch (e) {
+	}
+	tcpSocket = null
+}
+
+/** 断开 TCP 连接 */
+export function disconnectTcp() : void {
+	closeTcpInternal()
+}
+
+export function isTcpConnected() : boolean {
+	return tcpSocket != null && tcpSocket!.isConnected()
+}
+
+/* ------------------------------ WiFi 详情 ------------------------------ */
+
+/** 把 int 形式的 IPv4 转成 "x.x.x.x" */
+function formatIp(ip : Int) : string {
+	const MASK : Int = 0xff
+	const a = ip & MASK
+	const b = (ip >> 8) & MASK
+	const c = (ip >> 16) & MASK
+	const d = (ip >> 24) & MASK
+	return a.toString() + "." + b.toString() + "." + c.toString() + "." + d.toString()
+}
+
+/** 获取当前 WiFi 连接信息（用于判断手机与 RTK 是否同一局域网） */
+export function getWifiDetails(callback : (info : RtkWifiInfo) => void) : void {
+	// Android 10+ 取 WiFi 信息需要定位权限，权限缺失时 getConnectionInfo 可能抛异常，
+	// 这里整体兜底，避免 RTK 页面一进来就崩
+	try {
+		const ctx = appContext()
+		const wifi = ctx.getSystemService(Context.WIFI_SERVICE) as WifiManager
+		const info = wifi.getConnectionInfo()
+		let ssid = info.getSSID() ?? ""
+		if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length >= 2) {
+			ssid = ssid.substring(1, ssid.length - 1)
+		}
+		const out : RtkWifiInfo = {
+			address: formatIp(info.getIpAddress()),
+			ssid: ssid,
+			bssid: info.getBSSID() ?? "",
+			speed: info.getLinkSpeed().toString(),
+			rssi: info.getRssi().toString()
+		}
+		callback(out)
+	} catch (e) {
+		const empty : RtkWifiInfo = {
+			address: "0.0.0.0",
+			ssid: "",
+			bssid: "",
+			speed: "0",
+			rssi: "0"
+		}
+		callback(empty)
+	}
+}
+
+/** 打开系统 WiFi 设置页 */
+export function openWifiSettings() : void {
+	try {
+		const act = UTSAndroid.getUniActivity()
+		if (act == null) return
+		act.startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS))
+	} catch (e) {
+	}
+}
+
+/* ------------------------------ 权限 ------------------------------ */
+
+/** 申请蓝牙相关运行时权限（位置 + 蓝牙扫描/连接） */
+export function requestBluetoothPermission() : Promise<boolean> {
+	return new Promise((resolve, _reject) => {
+		const activity = UTSAndroid.getUniActivity()
+		if (activity == null) {
+			resolve(false)
+			return
+		}
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+			UTSAndroid.requestSystemPermission(activity!, [
+				"android.permission.BLUETOOTH_SCAN",
+				"android.permission.BLUETOOTH_CONNECT",
+				"android.permission.ACCESS_FINE_LOCATION"
+			], (allRight : boolean, _granted : Array<string>) => {
+				resolve(allRight)
+			}, (_doNotAskAgain : boolean, _granted : Array<string>) => {
+				resolve(false)
+			})
+		} else {
+			UTSAndroid.requestSystemPermission(activity!, [
+				"android.permission.ACCESS_FINE_LOCATION",
+				"android.permission.ACCESS_COARSE_LOCATION"
+			], (allRight : boolean, _granted : Array<string>) => {
+				resolve(allRight)
+			}, (_doNotAskAgain : boolean, _granted : Array<string>) => {
+				resolve(false)
+			})
+		}
+	})
+}
+
+/* ------------------------------ NMEA GGA 解析 ------------------------------ */
+
+/** 把度分格式（ddmm.mmmm / dddmm.mmmm）转成 WGS84 十进制度 */
+function degreeMinutesToDecimal(v : number) : number {
+	const degrees = Math.floor(v / 100)
+	const minutes = v - degrees * 100
+	return degrees + minutes / 60
+}
+
+/** fixQuality 数值 → 中文 + 英文状态 */
+function mapFixQuality(code : number) : RtkFix {
+	const zh = fixQualityZh(code)
+	let status = "unknown"
+	if (code == 4) status = "fixed"
+	else if (code == 5) status = "float"
+	else if (code == 1) status = "single"
+	else if (code == 2) status = "dgps"
+	else if (code == 6) status = "estimated"
+	else if (code == 0) status = "invalid"
+	return {
+		latitude: null,
+		longitude: null,
+		altitude: null,
+		fixQuality: zh,
+		fixQualityCode: code,
+		fixStatus: status,
+		satellitesUsed: null,
+		hdop: null,
+		time: null,
+		raw: ""
+	}
+}
+
+function fixQualityZh(code : number) : string {
+	switch (code) {
+		case 0: return "无效解"
+		case 1: return "单点定位"
+		case 2: return "差分GPS"
+		case 3: return "PPS定位"
+		case 4: return "RTK固定解"
+		case 5: return "RTK浮动解"
+		case 6: return "估算定位"
+		case 7: return "手动输入模式"
+		case 8: return "仿真模式"
+		default: return "未知"
+	}
+}
+
+/** 解析一行 NMEA GGA。不是 GGA 返回 null */
+export function parseGga(line : string) : RtkFix | null {
+	const t = line.trim()
+	if (t.length == 0) return null
+	// 精确匹配 $..GGA,（排除 $GPGSA / $GPGSV / $GPGST 等）
+	if (t.indexOf("GGA,") == -1) return null
+
+	const fields = t.split(",")
+	if (fields.length < 10) return null
+
+	const latRaw = toFloatSafe(fields[2])
+	const latDir = fields[3].trim()
+	const lonRaw = toFloatSafe(fields[4])
+	const lonDir = fields[5].trim()
+	const fixCode = toIntSafe(fields[6])
+
+	if (fixCode == null) return null
+
+	let fix = mapFixQuality(fixCode)
+	fix.raw = t
+	fix.time = fields[1].trim() == "" ? null : fields[1]
+
+	if (latRaw != null && lonRaw != null) {
+		let lat = degreeMinutesToDecimal(latRaw)
+		let lon = degreeMinutesToDecimal(lonRaw)
+		if (latDir == "S") lat = -lat
+		if (lonDir == "W") lon = -lon
+		fix.latitude = lat
+		fix.longitude = lon
+	}
+
+	fix.satellitesUsed = toIntSafe(fields[7])
+	fix.hdop = toFloatSafe(fields[8])
+	fix.altitude = toFloatSafe(fields[9])
+
+	return fix
+}
+
+/* ------------------------------ 释放 ------------------------------ */
+
+/** 注销蓝牙扫描广播（动态注册的 receiver 必须注销，否则泄漏） */
+function unregisterDiscoveryReceiver() : void {
+	const r = discoveryReceiver
+	if (r != null) {
+		try {
+			appContext().unregisterReceiver(r)
+		} catch (e) {
+		}
+	}
+	discoveryReceiver = null
+	discoveryCallback = null
+}
+
+export function destroy() : void {
+	stopBluetoothDiscovery()
+	unregisterDiscoveryReceiver()
+	closeBluetoothInternal()
+	closeTcpInternal()
+	dataListeners = []
+	lastFix = null
+}

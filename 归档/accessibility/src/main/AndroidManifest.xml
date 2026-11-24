@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="cn.lincq.accessibility" >
+    <uses-permission android:name="android.permission.REORDER_TASKS">
+    </uses-permission>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW">
+    </uses-permission>
+    <uses-permission android:name="android.permission.SYSTEM_OVERLAY_WINDOW">
+    </uses-permission>
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+    <application>
+        <service
+            android:name="cn.lincq.accessibility.service.AccService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:enabled="true"
+            >
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/config_accessibility" />
+
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService">
+                </action>
+            </intent-filter>
+        </service>
+        <receiver android:name=".tool.ScreenOnReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="cn.lincq.accessibility.WAKE_UP_SCREEN" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name="cn.lincq.accessibility.service.MyBroadcastReceiver" />
+
+    </application>
+</manifest>

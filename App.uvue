@@ -5,9 +5,12 @@
 	 * 返回键策略统一放在 pages/webview/webview.uvue 的 onBackPress 里处理
 	 * （先让网页 router 后退，退不动再双击退出），这里不再重复拦截。
 	 */
+	import { startAutoReconnect, stopAutoReconnect } from '@/bridge/rtk.uts'
 
 	onLaunch(() => {
 		console.log('[TDYB] App Launch')
+		// 全局自动回连：每 10 秒按上次记住的 RTK 设备重连（未连接才动作）
+		startAutoReconnect()
 	})
 
 	onAppShow(() => {
@@ -20,6 +23,7 @@
 
 	onExit(() => {
 		console.log('[TDYB] App Exit')
+		stopAutoReconnect()
 	})
 </script>
 

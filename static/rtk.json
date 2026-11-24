@@ -1,0 +1,50 @@
+[
+  {
+    "name": "千寻 SR mini",
+    "address": "1.1.1.1",
+    "port": "15160",
+    "connectivity": false
+  },
+  {
+    "name": "千寻 X mini",
+    "address": "1.1.1.1",
+    "port": "15160",
+    "connectivity": false
+  },
+  {
+    "name": "千寻 SR6 Plus",
+    "address": "1.1.1.1",
+    "port": "15160",
+    "connectivity": false
+  },
+  {
+    "name": "千寻 K20",
+    "address": "1.1.1.1",
+    "port": "15160",
+    "connectivity": false
+  },
+  {
+    "name": "千寻 SE Lite",
+    "address": "192.168.10.1",
+    "port": "9000",
+    "connectivity": false
+  },
+  {
+    "name": "华测系列",
+    "address": "192.168.1.1",
+    "port": "1212",
+    "connectivity": false
+  },
+  {
+    "name": "中海达系列",
+    "address": "192.168.20.1",
+    "port": "4545",
+    "connectivity": false
+  },
+  {
+    "name": "南方测绘银河6",
+    "address": "10.1.1.1",
+    "port": "2010",
+    "connectivity": false
+  }
+]

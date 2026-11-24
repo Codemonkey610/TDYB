@@ -1,0 +1,317 @@
+/**
+ * RTK 定位桥接层（壳侧）。
+ *
+ * 对下调用 uni_modules/tdyb-rtk（蓝牙 SPP / WiFi TCP + NMEA）。
+ * 对上复用现有定位协议：startGetLocationService / getPreciseLocation 等方法名不变，
+ * 只要 RTK 任一通道已连接，就优先用 RTK 数据，否则回退高德（在 location.uts 里做分支）。
+ *
+ * RTK 是推流（NMEA 持续到达），没有请求/响应，所以：
+ *   - 持续定位 = 注册 dataListener，每来一条有效 GGA 就回写一次
+ *   - 单次定位 = 有近期固定解直接用，否则注册临时监听等下一个 GGA，超时回 fail
+ */
+
+import {
+	isRtkConnected,
+	registerDataListener,
+	unregisterDataListener,
+	getLastFix,
+	getLastFixAt,
+	parseGga,
+	connectTcp,
+	scanTcpPort,
+	connectBluetooth,
+	closeBluetoothConnection,
+	disconnectTcp,
+	destroy as rtkDestroy,
+	RtkFix,
+	RtkResult
+} from '@/uni_modules/tdyb-rtk'
+import { COORD_GCJ02 } from './protocol.uts'
+import { replyJson, replyError } from './reply.uts'
+import { wgs84ToGcj02 } from '@/utils/coord.uts'
+
+/* ------------------------------ 状态 ------------------------------ */
+
+let streaming : boolean = false
+let streamKey : string = ""
+let streamCoord : string = "wgs84"
+let streamListener : ((data : string) => void) | null = null
+
+/* ------------------------------ 工具 ------------------------------ */
+
+/**
+ * RTK 是否真的可用（数据驱动，而不只是 socket 状态）。
+ *
+ * socket.isConnected() 只反映本地有没有 close()：
+ * 对端断电/热点休眠/读线程卡死后它照样返回 true（假连接）。
+ * 所以必须叠加「最近是否在持续收到 GGA」判断：
+ *   - 从未收到数据（刚连接还在搜星）→ 视为活跃，给宽限
+ *   - 曾经有数据但超过 10 秒没更新 → 数据流已卡死，视为不活跃，
+ *     定位会自动回退高德，避免一直给用户同一个过期坐标
+ */
+const RTK_FRESH_MS : number = 10000
+
+export function rtkIsActive() : boolean {
+	if (!isRtkConnected()) return false
+	const at = getLastFixAt()
+	if (at <= 0) return true
+	return Date.now() - at <= RTK_FRESH_MS
+}
+
+/** 数据是否新鲜（最近一次 GGA 在阈值内） */
+function lastFixFresh() : boolean {
+	const at = getLastFixAt()
+	if (at <= 0) return false
+	return Date.now() - at <= RTK_FRESH_MS
+}
+
+/** 根据 fixQuality 估一个水平精度（米），前端用它判断固定解（<= 0.05m） */
+function accuracyFor(fix : RtkFix) : number {
+	const code = fix.fixQualityCode
+	if (code != null) {
+		if (code == 4) return 0.02
+		if (code == 5) return 0.3
+		if (code == 1) return 2.0
+		if (code == 2) return 0.5
+	}
+	const h = fix.hdop
+	if (h != null && h > 0) return h
+	return 5.0
+}
+
+/** 组装成前端 normalizeLocation 认识的扁平结构 */
+export function buildRtkFix(fix : RtkFix, coord : string) : UTSJSONObject {
+	const rawLat = fix.latitude ?? 0
+	const rawLng = fix.longitude ?? 0
+
+	let lat = rawLat
+	let lng = rawLng
+	if (coord == COORD_GCJ02) {
+		const p = wgs84ToGcj02(rawLat, rawLng)
+		lat = p.latitude
+		lng = p.longitude
+	}
+
+	const alt = fix.altitude ?? 0
+	const acc = accuracyFor(fix)
+
+	const coords : UTSJSONObject = {
+		"latitude": lat,
+		"longitude": lng,
+		"accuracy": acc,
+		"altitude": alt,
+		"speed": 0
+	}
+	const wgs84 : UTSJSONObject = {
+		"latitude": rawLat,
+		"longitude": rawLng
+	}
+
+	const out : UTSJSONObject = {
+		"longitude": lng,
+		"latitude": lat,
+		"altitude": alt,
+		"accuracy": acc,
+		"speed": 0,
+		"bearing": 0,
+		"coordType": coord,
+		"coordsType": coord,
+		"fixStatus": fix.fixStatus,
+		"provider": "rtk",
+		"satellites": fix.satellitesUsed ?? 0,
+		"hdop": fix.hdop ?? 0,
+		"timestamp": Date.now(),
+		"errorCode": 0,
+		"coords": coords,
+		"wgs84": wgs84
+	}
+	return out
+}
+
+/* ------------------------------ 持续定位 ------------------------------ */
+
+function onRtkData(data : string) : void {
+	const fix = parseGga(data)
+	if (fix == null) return
+	if (fix.latitude == null || fix.longitude == null) return
+	if (!streaming) return
+	replyJson(streamKey, buildRtkFix(fix, streamCoord))
+}
+
+export function stopRtkStream() : void {
+	// 顶层可变属性不能 smart cast，先取到不可变局部变量
+	const l = streamListener
+	if (l != null) unregisterDataListener(l)
+	streamListener = null
+	streaming = false
+	streamKey = ""
+}
+
+export function startRtkStream(key : string, coord : string) : void {
+	stopRtkStream()
+	streaming = true
+	streamKey = key
+	streamCoord = coord
+	const l : (data : string) => void = (data : string) => {
+		onRtkData(data)
+	}
+	streamListener = l
+	registerDataListener(l)
+	console.log("[TDYB] RTK 持续定位已启动")
+}
+
+/* ------------------------------ 单次定位 ------------------------------ */
+
+export function rtkOnce(key : string, coord : string, timeoutMs : number) : void {
+	// 2 秒内刚收到过有效 GGA，直接秒回
+	const recent = getLastFix()
+	const at = getLastFixAt()
+	if (recent != null && recent.latitude != null && recent.longitude != null &&
+		at > 0 && Date.now() - at <= 2000) {
+		replyJson(key, buildRtkFix(recent, coord))
+		return
+	}
+
+	let done : boolean = false
+	let tmp : ((data : string) => void) | null = null
+
+	// 局部函数里重新取一次，避免对「被闭包捕获的可变变量」做 smart cast
+	function cleanup() : void {
+		const t = tmp
+		if (t != null) unregisterDataListener(t)
+	}
+
+	const timer = setTimeout(() => {
+		if (done) return
+		done = true
+		cleanup()
+		const f = getLastFix()
+		// 兜底缓存必须是「新鲜」的：数据流卡死后 lastFix 会永远停在旧坐标，
+		// 不加新鲜度校验就会出现「点定位永远是同一个位置」
+		if (f != null && f.latitude != null && f.longitude != null && lastFixFresh()) {
+			replyJson(key, buildRtkFix(f, coord))
+		} else {
+			replyError(key, "RTK 数据已过期，正在重连，请稍后再试")
+		}
+	}, timeoutMs)
+
+	tmp = (data : string) => {
+		if (done) return
+		const f = parseGga(data)
+		if (f == null || f.latitude == null || f.longitude == null) return
+		done = true
+		clearTimeout(timer)
+		cleanup()
+		replyJson(key, buildRtkFix(f, coord))
+	}
+
+	const l = tmp
+	if (l != null) registerDataListener(l)
+}
+
+/* ------------------------------ 自动回连 ------------------------------ */
+
+let autoReconnectTimer : number | null = null
+let reconnectTick : number = 0
+let reconnectFail : number = 0
+
+/**
+ * 假连接自愈：socket 显示已连接，但超过阈值没收到新 GGA，
+ * 说明对端已掉线（读线程卡死/半关闭），isConnected() 只是误报。
+ * 主动断开本地 socket，让下面的重连逻辑把连接重新建立起来。
+ */
+const RTK_STALE_HEAL_MS : number = 20000
+
+function healStaleConnection() : void {
+	if (!isRtkConnected()) return
+	const at = getLastFixAt()
+	// 从未收到数据不判失活（刚连接还在搜星）
+	if (at <= 0) return
+	if (Date.now() - at > RTK_STALE_HEAL_MS) {
+		console.warn("[TDYB] RTK 数据流假连接（" + ((Date.now() - at) / 1000).toString() + "s 无新数据），主动断开并触发重连")
+		closeBluetoothConnection()
+		disconnectTcp()
+	}
+}
+
+/** 尝试按上次记住的设备重连（仅当当前未连接时执行） */
+function tryAutoReconnect() : void {
+	// 先做假连接自愈：连着但数据卡死 → 断开，随后走正常重连
+	healStaleConnection()
+
+	if (isRtkConnected()) {
+		// 已连上，清空失败计数，下次断了还能快速重连
+		reconnectFail = 0
+		return
+	}
+
+	reconnectTick++
+	// 连续失败 6 次后降频：每 6 个轮询（约 1 分钟）才再试一次，避免一直扫端口耗电
+	if (reconnectFail >= 6 && reconnectTick % 6 != 0) return
+
+	// getStorageSync 返回可空 Any，先落到 string 再 JSON.parse，避免 instanceof 类型断言风险
+	const saved = uni.getStorageSync('rtkDevice')
+	if (saved == null) return
+	const savedStr = saved.toString()
+	if (savedStr == "") return
+
+	let obj : UTSJSONObject | null = null
+	try {
+		const parsed = JSON.parse(savedStr)
+		if (parsed instanceof UTSJSONObject) {
+			obj = parsed as UTSJSONObject
+		}
+	} catch (e) {
+		return
+	}
+	if (obj == null) return
+
+	const type = obj.getString("type") ?? ""
+	const address = obj.getString("address") ?? ""
+	if (address == "") return
+
+	reconnectFail++
+
+	if (type == "wifi") {
+		const portStr = obj.getString("port") ?? ""
+		const port = parseInt(portStr, 10)
+		if (isNaN(port) || port <= 0) return
+		// 先探测端口是否开放，开放才连（避免盲连卡顿）
+		scanTcpPort(address, port, (open : boolean) => {
+			if (open && !isRtkConnected()) {
+				connectTcp(address, port, (_res : RtkResult) => {})
+			}
+		})
+	} else if (type == "bluetooth") {
+		connectBluetooth(address, (_res : RtkResult) => {})
+	}
+}
+
+/** 开启自动回连（App 启动时调用），每 10 秒轮询一次，连续失败后自动降频 */
+export function startAutoReconnect() : void {
+	stopAutoReconnect()
+	reconnectTick = 0
+	reconnectFail = 0
+	tryAutoReconnect()
+	autoReconnectTimer = setInterval(() => {
+		tryAutoReconnect()
+	}, 10000)
+}
+
+/** 关闭自动回连 */
+export function stopAutoReconnect() : void {
+	// 同 stopRtkStream：顶层可变属性不能 smart cast，先落局部常量
+	const t = autoReconnectTimer
+	if (t != null) {
+		clearInterval(t)
+		autoReconnectTimer = null
+	}
+}
+
+/* ------------------------------ 释放 ------------------------------ */
+
+export function stopAll() : void {
+	stopAutoReconnect()
+	stopRtkStream()
+	rtkDestroy()
+}

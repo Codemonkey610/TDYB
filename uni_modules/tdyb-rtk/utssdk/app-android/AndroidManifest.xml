@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        经典蓝牙（SPP）RTK 所需的全部权限。
+        Android 12 (API 31) 以前用 BLUETOOTH / BLUETOOTH_ADMIN，
+        之后改用 BLUETOOTH_SCAN / BLUETOOTH_CONNECT（运行时申请）。
+        位置权限 ACCESS_FINE_LOCATION 是蓝牙扫描必需的（主 manifest.json 已声明，这里补一份显式说明）。
+    -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+
+</manifest>
